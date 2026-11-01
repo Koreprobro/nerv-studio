@@ -1,0 +1,9 @@
+# OS
+.DS_Store
+
+# Build / runtime outputs (tentative — expand once the language is locked)
+/bin/
+/dist/
+*.exe
+*.out
+*.o
