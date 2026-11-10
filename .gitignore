@@ -1,0 +1,12 @@
+# OS
+.DS_Store
+
+# Build / runtime outputs
+/bin/
+/dist/
+*.exe
+*.out
+*.o
+
+# Local configuration (the tracked sample is nerv.json.example)
+nerv.json

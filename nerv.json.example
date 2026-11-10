@@ -1,0 +1,43 @@
+{
+  "_comment": "nerv-core daemon configuration — SAMPLE. Copy to <project-root>/nerv.json (or point --config at a copy) and edit; the daemon reads <project-root>/nerv.json by default. Precedence: explicitly passed CLI flag > this file > built-in default. The CLI accepts both spellings (--ai_url and --ai-url); '--env KEY=VALUE' is repeatable and merges over the 'env' section. Strict JSON: only the exact '_comment' key is ignored; the '_comment_*' documentation keys in this sample warn once at startup and are dropped — delete them freely when you copy. Full per-key contract: SPECS.md sections 2 and 3.7.",
+
+  "domains": {
+    "tools":       { "path": "tools",        "commands": ["probe", "read", "execute"], "hint": "sh toolbox; the generation surface" },
+    "kb":          { "path": "kb",           "commands": ["read", "probe"],            "hint": "knowledge base; walk from README.md" },
+    "artifactory": { "path": "artifactory",  "commands": ["browse", "probe", "read", "fetch", "write", "mount"], "hint": "artifact repository; the consumer playground" },
+    "loras":       { "path": "lora-model-dir", "commands": ["browse", "probe", "fetch"], "hint": "model store; weights repository" }
+  },
+
+  "_comment_domains": "The whole storage surface is this map — there are no built-in roots (the old root keys tools/artifactory/kb/lora_model_dir/logs and the hints map are retired). One domain entry: path (absolute, or relative to the project root = the parent of the bin/ directory holding the daemon, never the launch cwd), commands (the allow-list the consumer tool speaks), hint (the tools/list description). The domain name is the MCP tool name: [A-Za-z0-9_.-], no collision with dice.roll/calc.resolution/gpu.list. Two commands are structural grants: 'mount' marks THE playground (io jail, queue files, /artifacts, wave lineage — exactly one domain must carry it, the directory is created on startup) and 'execute' marks a toolbox (queue tool names resolve to <path>/<tool>.sh; the probe command speaks the tool-info dialect; several toolboxes are legal, none makes the studio browse-only). A forbidden command answers isError with the available list; fullRawAccess=true ignores the allow-list entirely.",
+
+  "ai_url": "http://127.0.0.1:5000/v1",
+  "llm_offload": false,
+  "gpu_backend": "",
+  "external_gpu": "",
+  "port": 9696,
+  "max_output_chars": 32768,
+
+  "_comment_runtime": "debug is a flag-only operator switch (--debug): wave logs (jsonl events + streamed job output) written beside the queue file as <queue-stem>.log, old same-name logs rotate through the archive mechanism. ai_url = OpenAI-compatible provider used for the VRAM wash-out (default: local llama-server). llm_offload=true turns on the VRAM XOR: every loaded LLM is unloaded before a wave that has gpu-require>0 jobs, and such waves run blocking (the request waits, SSE with a progressToken); false = every wave async, daemon-owned. gpu_backend filters the pool — comma terms 'backend[@host][:i|a-b]' like 'cuda,rocm:0-1'; empty means the greedy scoop of everything detected (cuda/rocm/intel). external_gpu adds anonymous remote slots — 'backend@host[:N]', N default 1, e.g. 'cuda@host1:2,rocm@host2' (no detection, no health-check; transport is the sh scripts' business). port = the single HTTP surface (/mcp + /artifacts). max_output_chars = volume guard for tool-result text; the full dump is re-served with volume_ack=true.",
+
+  "env": {
+    "HF_HOME": "/ai/hf",
+    "OMP_NUM_THREADS": "8",
+    "LORA_MODEL_DIR": "/ai/loras"
+  },
+
+  "_comment_env": "Machine-level environment mixed AS-IS (no prefix) into every tool launch, including --tool-info probes: caches, proxies, thread limits, machine paths the scripts read (LoRA store: LORA_MODEL_DIR) — the core never interprets these values, the scripts stay the authority. Keys starting with NERV_ are rejected at startup with a warning: that prefix belongs to the scheduler<->sh contract. (A '_comment' key here would become a real env var — this section documents itself from SPECS.)",
+
+  "media": {
+    "_comment": "Default budgets for bounded content into the consumer context (read/fetch). Zero/absent fields fall back to the built-in defaults shown here; every field is also overridable per call. max_bytes: text read cap (16 KiB). max_block_bytes: per media block budget (512 KiB) — over budget, images degrade quality first, then dimensions. max_dim: image longest side, px (1600). video_max_dim: video thumbnail longest side, px (800). quality: JPEG quality 1-100 (82). format: image re-encode, jpeg or png. rate/channels/bitrate: audio preview shape — 16 kHz mono 64k mp3. max_duration: audio/video preview length, seconds (30).",
+    "max_bytes": 16384,
+    "max_block_bytes": 524288,
+    "max_dim": 1600,
+    "video_max_dim": 800,
+    "quality": 82,
+    "format": "jpeg",
+    "rate": 16000,
+    "channels": 1,
+    "bitrate": "64k",
+    "max_duration": 30
+  }
+}
