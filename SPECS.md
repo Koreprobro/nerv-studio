@@ -27,9 +27,7 @@ The daemon derives the project root from its own location:
 ├── src/nerv-gui/          web client (pure MCP client)
 ├── tools/                 consumer sh toolbox (*.sh, self-documenting)
 ├── kb/                    knowledge base (*.md, README.md is the entry)
-├── docs/                  development material (not consumer kb)
 ├── nerv.json              runtime configuration (sample: nerv.json.example)
-├── nerv-core.service      systemd user unit (symlinked from ~/.config/systemd/user/)
 └── Makefile               build | test | vet | clean
 ```
 
@@ -237,12 +235,6 @@ Invariants:
   and playground store are resolved from the map (the `execute`- and
   `mount`-domain roots) at startup; the launch contract (§5) does not
   change.
-
-> Legacy config revisions that name separate root keys (`tools`,
-> `artifactory`, `kb`, `lora_model_dir`, `logs`) or the `hints`/`debug`
-> file keys read as unknown keys and warn once at startup; the old root
-> flags (`--tools` &c.) are gone — the remaining flags are `--config`,
-> `--debug` and one flag per runtime key of §2.2.
 
 ---
 
