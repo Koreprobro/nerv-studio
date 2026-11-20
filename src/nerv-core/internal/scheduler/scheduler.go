@@ -18,7 +18,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package scheduler runs a submitted queue across the typed GPU pool with
-// file-existence dataflow (REBUILD-nerv-core.md §2.4, §2.5).
+// file-existence dataflow (SPECS §6.3, §6.7).
 //
 // There is no dependency graph: a job declares its output files through
 // io-marked fields and its input files the same way. The scheduler
@@ -47,11 +47,13 @@ type Progress func(*job.Job, job.Status)
 
 // Deps wires the scheduler to the studio directories, the frozen pool and
 // the operator env (config "env": passed to scripts as-is). The scheduler
-// needs no other roots: io paths are resolved against the artifactory, the
-// scripts own everything else (SPECS §5).
+// needs no other roots: io paths are playground-relative (the launched
+// script's cwd is the mount root), the scripts own everything else
+// (SPECS §5).
 type Deps struct {
 	ToolsDir    string
 	Artifactory store.Store
+	MountName   string // active mount domain name — the "nest/<mount>/" fold target
 	Pool        *gpu.Pool
 	UserEnv     map[string]string
 }
@@ -61,26 +63,24 @@ type Deps struct {
 // stay package-private — callers treat it as an opaque handle for
 // RunAdmitted/WantsGPU.
 type Admitted struct {
-	idx       int
-	j         *job.Job
-	outputs   []string
-	inputs    []string
-	outFields map[string]bool // param names declared io:"out" — their env values go absolute (§5)
-	inFields  map[string]bool // param names declared io:"in" — absolute in env too (§5.1)
-	calc      bool            // tool declares the aspect-ratio + target-mpx pair (§7.3)
-	archived  []string        // outputs whose old same-name file was moved aside (§SPECS 6)
-	count     int
-	backend   string
-	pin       string
-	eligible  []gpu.Slot // backend ∩ pin; empty only for CPU jobs
-	status    job.Status
-	err       string
-	slots     []gpu.Slot
-	dur       time.Duration
+	idx      int
+	j        *job.Job
+	outputs  []string
+	inputs   []string
+	calc     bool     // tool declares the aspect-ratio + target-mpx pair (SPECS §7.3)
+	archived []string // outputs whose old same-name file was moved aside (SPECS §6.5)
+	count    int
+	backend  string
+	pin      string
+	eligible []gpu.Slot // backend ∩ pin; empty only for CPU jobs
+	status   job.Status
+	err      string
+	slots    []gpu.Slot
+	dur      time.Duration
 }
 
 // Skipped is a queue line that never entered the wave loop: the entry-level
-// home of every soft validation failure (§2.3 skipped[{index, tool, reason}]).
+// home of every soft validation failure (SPECS §6.2 skipped[{index, tool, reason}]).
 type Skipped struct {
 	Index  int    `json:"index"`
 	Tool   string `json:"tool"`
@@ -127,7 +127,7 @@ type Scheduler struct {
 func New(d Deps) *Scheduler { return &Scheduler{Deps: d} }
 
 // Admit validates queue lines without running anything: tool resolution,
-// the --tool-info interface, the field check and GPU admission (§2.3). Soft
+// the --tool-info interface, the field check and GPU admission (SPECS §6.2, §6.7). Soft
 // failures leave the queue in skipped[{index, tool, reason}]; the caller
 // decides what to do with the accepted remainder — run it now or own it as
 // an async wave (the mcp layer is the only scheduling client).
@@ -152,26 +152,12 @@ func (s *Scheduler) Admit(queue []job.Job) ([]*Admitted, []Skipped) {
 			}
 			infos[tool] = ti
 		}
-		outs, ins, reason := q.Check(ti)
+		outs, ins, reason := q.Check(ti, s.Deps.MountName)
 		if reason != "" {
 			skipped = append(skipped, Skipped{i, tool, reason})
 			continue
 		}
 		e := &Admitted{idx: i, j: q, outputs: outs, inputs: ins, status: job.Pending}
-		for k := range ti.Fields {
-			switch ti.Fields[k].IO {
-			case "out":
-				if e.outFields == nil {
-					e.outFields = map[string]bool{}
-				}
-				e.outFields[ti.Fields[k].Name] = true
-			case "in":
-				if e.inFields == nil {
-					e.inFields = map[string]bool{}
-				}
-				e.inFields[ti.Fields[k].Name] = true
-			}
-		}
 		e.calc = declaresCalcPair(ti)
 		e.count, e.backend, e.pin = q.Require(ti), q.Backend(ti), q.Pin(ti)
 		if e.count > 0 {
@@ -193,7 +179,7 @@ func (s *Scheduler) Admit(queue []job.Job) ([]*Admitted, []Skipped) {
 }
 
 // WantsGPU reports whether any admitted line asks for GPU slots — the
-// XOR-offload and blocking-mode trigger for the mcp layer (§2.3).
+// XOR-offload and blocking-mode trigger for the mcp layer (SPECS §6.6, §8).
 func WantsGPU(adm []*Admitted) bool {
 	for _, e := range adm {
 		if e.count > 0 {
@@ -209,14 +195,14 @@ func (a *Admitted) Index() int    { return a.idx }
 func (a *Admitted) Tool() string  { return a.j.Tool }
 func (a *Admitted) Job() *job.Job { return a.j }
 
-// RunOpts tunes one admitted wave. LogPath is the wave log file beside the
-// queue file (<queue-stem>.log, §2.7): when set, the scheduler writes the
+// RunOpts tunes one admitted wave. LogPath is the transient debug wave log
+// (system temp, SPECS §6.6): when set, the scheduler writes the
 // event lines and every job's streamed stdout+stderr into this one file.
 // Empty means no files at all — job output then lives only in the capped
-// in-memory buffer feeding the failed-tail (M12 default).
+// in-memory buffer feeding the failed-tail (SPECS §5 default).
 type RunOpts struct {
 	WaveID  string // ledger id carried in dump events (optional)
-	LogPath string // wave log file beside the queue; "" = no log
+	LogPath string // transient debug log path; "" = no log
 }
 
 // RunAdmitted dispatches accepted entries in waves until everything is

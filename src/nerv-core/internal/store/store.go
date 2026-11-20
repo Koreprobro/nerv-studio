@@ -18,7 +18,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package store is the artifactory root helper (the old 30-line artifactory
-// package folded in, REBUILD §4.4): paths inside the artifactory are
+// package folded in): paths inside the artifactory are
 // canonical artifactory-relative; absolute composition happens only here.
 package store
 
@@ -57,7 +57,7 @@ func (s Store) EnsureOutputDir(rel string) error {
 // name — index BEFORE the extension ("name-1.png", "name-2.png"; "name-1"
 // when there is none), the first free index wins. It returns the archived
 // rel path ("" when nothing existed to archive). This is the core's
-// same-name overwrite protection (SPECS §6): the consumer-AI gets exactly
+// same-name overwrite protection (SPECS §6.5): the consumer-AI gets exactly
 // the name it declared, conflicts resolve in favor of the new file.
 func (s Store) ArchiveIndex(rel string) (string, error) {
 	abs := s.Abs(rel)

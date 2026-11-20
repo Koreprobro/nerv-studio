@@ -25,22 +25,28 @@ import (
 	"strings"
 )
 
-// URLMount is the HTTP mount name of the artifactory (GET /artifacts/<rel>).
-// It is not a directory of the artifactory root — NormalizePath folds it away.
-const URLMount = "artifacts"
+// URLPrefix is the HTTP file mount name (GET /nest/<domain>/<rel>, SPECS §3.1).
+// It is not a directory of any domain — NormalizePath folds it away together
+// with the active mount domain's name segment.
+const URLPrefix = "nest"
 
-// NormalizePath folds the URL-mount prefix and cleans the path to the
-// canonical artifactory-relative form. The leniency is decided and kept
-// (REBUILD §4.5): consumers copy "artifacts/..." out of artifactURL and hand
-// it back; the canonical stored/served form never carries the prefix, so
-// dual names never coexist silently — one-way fold, tested here.
-func NormalizePath(p string) string {
+// NormalizePath folds a copied artifactURL ("nest/<mount>/<rel>") back to the
+// canonical playground-relative form and cleans the path. The leniency is
+// decided and kept (SPECS §3.1): consumers copy URL text out of answers and
+// hand it back; the canonical stored/served form carries neither the prefix
+// nor the domain segment, so dual names never coexist silently. A URL of a
+// foreign domain ("nest/<other>/…") does not fold — it reads as an ordinary
+// playground path and fails on existence (files of other domains enter queues
+// only via copy, SPECS §3.7).
+func NormalizePath(p, mount string) string {
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return ""
 	}
-	if t := strings.TrimPrefix(p, URLMount+"/"); t != p && t != "" {
-		p = t
+	if mount != "" {
+		if rest, ok := strings.CutPrefix(p, URLPrefix+"/"+mount+"/"); ok && rest != "" {
+			p = rest
+		}
 	}
 	return filepath.ToSlash(filepath.Clean(p))
 }

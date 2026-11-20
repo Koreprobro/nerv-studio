@@ -68,7 +68,7 @@ func ProbeTool(toolsDir, name string) (*job.ToolInfo, error) {
 }
 
 // admit resolves a job's GPU admission set — backend ∩ pin — fail-fast:
-// a nail that missed the wall never enters the wave loop (§2.5).
+// a nail that missed the wall never enters the wave loop (SPECS §6.7).
 func admit(pool *gpu.Pool, backend, pin string) ([]gpu.Slot, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("gpu-require > 0 but no GPU pool is configured")

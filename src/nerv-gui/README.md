@@ -1,8 +1,9 @@
 # nerv-gui
 
-Web frontend (planned): an AI chat with sub-agents plus a non-linear
-composition table. A pure MCP client — drives `nerv-core` exclusively
-through the MCP surface, no private channel.
+Frontend layer: hosts the **consumer AI** and the cognitive roles
+(manager / art director / prompt engineer / gatekeeper / assembler).
 
-Status: the GUI phase has not started; the core is fully usable today
-through any MCP client.
+- **Stack:** TypeScript / React.
+- Drives `nerv-core` exclusively through the MCP surface (no direct console/DB access).
+- **Status:** In far-distant TBO. Currently a draft of intent; GUI phase has not yet fully started.
+

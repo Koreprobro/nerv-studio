@@ -75,7 +75,7 @@ func normalizeArgs(args []string) []string {
 }
 
 // Parse resolves args (without the program name) into a Config:
-// built-in defaults < config file < explicitly passed flags (§2.1).
+// built-in defaults < config file < explicitly passed flags (SPECS §2.1).
 // A malformed/unreadable config file is fatal; a missing default-path file
 // is fine. Unknown config keys only warn (typo trap for AI-authored files).
 func Parse(args []string) (*Config, error) {
@@ -88,7 +88,7 @@ func ParseWithRoot(args []string, root string) (*Config, error) {
 
 	fs := flag.NewFlagSet("nerv-core", flag.ContinueOnError)
 	configPath := fs.String("config", "", "config file (default <project-root>/nerv.json when present)")
-	debug := fs.Bool("debug", false, "operator debug mode: wave logs written beside the queue file")
+	debug := fs.Bool("debug", false, "operator debug mode: wave logs run in the temp dir and fold into the queue file's wave block")
 	aiURL := fs.String("ai_url", "", "OpenAI-compatible provider URL (LLM transport)")
 	llmOffload := fs.Bool("llm_offload", false, "XOR VRAM: offload LLM before GPU waves (blocking SSE)")
 	gpuBackend := fs.String("gpu_backend", "", "GPU pool selector, e.g. cuda,rocm:0-1 (empty => greedy scoop)")
@@ -145,7 +145,7 @@ func ParseWithRoot(args []string, root string) (*Config, error) {
 		cfg.Env[k] = v
 	}
 
-	// The NERV_ prefix belongs to the scheduler<->sh contract (§2.4):
+	// The NERV_ prefix belongs to the scheduler<->sh contract (SPECS §2.2, §5.1):
 	// user env keys carrying it are rejected at startup, never silently.
 	var rejected []string
 	for k := range cfg.Env {
@@ -169,7 +169,7 @@ func ParseWithRoot(args []string, root string) (*Config, error) {
 }
 
 // utilityToolNames are the non-domain surface names a domain must not take.
-var utilityToolNames = map[string]bool{"dice.roll": true, "calc.resolution": true, "gpu.list": true}
+var utilityToolNames = map[string]bool{"dice.roll": true, "calc.resolution": true}
 
 // validateDomains enforces the storage contract (SPECS §3.7): exactly one
 // domain carries the structural "mount" grant — the playground every

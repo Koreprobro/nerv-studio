@@ -19,7 +19,7 @@
 
 // Command nerv-core is the omni-channel AI studio core: a thin daemon that
 // orchestrates system-installed generation tools, runs a typed GPU scheduler
-// and serves a streamable MCP endpoint (REBUILD-nerv-core.md §2).
+// and serves a streamable MCP endpoint (SPECS.md).
 package main
 
 import (
@@ -42,7 +42,7 @@ import (
 )
 
 func main() {
-	// The daemon does not log (M12): MCP answers and artifactory files are
+	// The daemon does not log (SPECS §6.6): MCP answers and artifactory files are
 	// the surface. Startup speaks via stderr warnings, log.Fatalf on fatal
 	// failure only.
 	cfg, err := config.Parse(os.Args[1:])
@@ -53,7 +53,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "nerv-core: warn: %s\n", w)
 	}
 
-	// The typed GPU pool is frozen at startup (REBUILD §2.5): greedy scoop
+	// The typed GPU pool is frozen at startup (SPECS §6.7): greedy scoop
 	// filtered by gpu_backend, plus external_gpu entries. Absent backends
 	// only warn — a CPU-only host must still serve the studio.
 	pool, gw, err := gpu.Build(cfg.GPUBackend, cfg.ExternalGPU, gpu.DefaultEnumerators())
@@ -78,6 +78,7 @@ func main() {
 		scheds[name] = scheduler.New(scheduler.Deps{
 			ToolsDir:    cfg.Domains[name].Path,
 			Artifactory: store.Store{Root: mount.Path},
+			MountName:   mountName,
 			Pool:        pool,
 			UserEnv:     cfg.Env,
 		})
@@ -97,7 +98,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-	// Graceful shutdown (REBUILD §5 gate 9): stop the HTTP surface, let
+	// Graceful shutdown (SPECS §6.6): stop the HTTP surface, let
 	// async waves finish within grace — stragglers get their process
 	// groups SIGKILLed by the wave-ctx cancel inside srv.Shutdown.
 	grace := 5 * time.Second

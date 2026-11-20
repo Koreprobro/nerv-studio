@@ -31,7 +31,7 @@ import (
 	"nerv-core/internal/config"
 )
 
-// SSE rides the blocking mode only (§2.3): offload on + a GPU wave. The
+// SSE rides the blocking mode only (SPECS §6.6): offload on + a GPU wave. The
 // final response and the progress notifications share one stream.
 func TestExecuteSSE(t *testing.T) {
 	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) { cfg.LLMOffload = true }, cudaPool(1))
@@ -58,6 +58,9 @@ func TestExecuteSSE(t *testing.T) {
 	txt := string(all)
 	if !strings.Contains(txt, "notifications/progress") || !strings.Contains(txt, "tok-1") {
 		t.Errorf("progress notification missing: %.400s", txt)
+	}
+	if !strings.Contains(txt, "markdown") || !strings.Contains(txt, "[sse]") {
+		t.Errorf("human markdown feed missing: %.400s", txt)
 	}
 	if !strings.Contains(txt, "sse.txt") {
 		t.Error("final response event missing")
@@ -136,16 +139,54 @@ func TestVolumeGuard(t *testing.T) {
 	}
 }
 
-func TestGPUListHiddenButCallable(t *testing.T) {
+// TestGPUDiagRetired pins the removal of the hidden gpu.list utility: the
+// name is no longer a tool (the VRAM drain kept only the internal
+// gpu.QueryLoad), so the call is an unknown-tool error and the surface
+// carries no trace of it.
+func TestGPUDiagRetired(t *testing.T) {
 	ts, _ := fixture(t)
-	res, _ := call(t, ts, "gpu.list", nil)
-	if res.IsError {
-		t.Errorf("gpu.list call: %s", firstText(res))
+	out := rpc(t, ts, `9`, "tools/call", map[string]any{"name": "gpu.list", "arguments": map[string]any{}})
+	if out["error"] == nil {
+		t.Error("gpu.list is retired: the call must be an unknown-tool error")
 	}
-	out := rpc(t, ts, `9`, "tools/list", nil)
-	b, _ := json.Marshal(out)
+	lst := rpc(t, ts, `10`, "tools/list", nil)
+	b, _ := json.Marshal(lst)
 	if strings.Contains(string(b), "gpu.list") {
 		t.Error("gpu.list leaked into tools/list")
+	}
+}
+
+// TestNestServing pins the /nest/<domain>/<rel> file mount (SPECS §3.1):
+// playground and reference files are served, the execute-granted toolbox
+// masks its scripts, unknown domains and traversal answer 404.
+func TestNestServing(t *testing.T) {
+	ts, art := fixture(t)
+	if err := os.WriteFile(filepath.Join(art, "served.txt"), []byte("nest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	get := func(p string) int {
+		t.Helper()
+		resp, err := http.Get(ts.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get("/nest/artifactory/served.txt"); code != 200 {
+		t.Errorf("playground file: %d", code)
+	}
+	if code := get("/nest/kb/README.md"); code != 200 {
+		t.Errorf("reference-domain file: %d", code)
+	}
+	if code := get("/nest/tools/echo.sh"); code != 404 {
+		t.Errorf("toolbox files must stay masked: %d", code)
+	}
+	if code := get("/nest/ghost/x"); code != 404 {
+		t.Errorf("unknown domain: %d", code)
+	}
+	if code := get("/nest/artifactory/"); code != 404 {
+		t.Errorf("directory must 404: %d", code)
 	}
 }
 

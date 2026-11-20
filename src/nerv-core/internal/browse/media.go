@@ -25,9 +25,7 @@ import (
 	"image"
 	_ "image/gif"
 	"image/jpeg"
-	_ "image/jpeg"
 	"image/png"
-	_ "image/png"
 	"os"
 	"strings"
 )
@@ -91,7 +89,10 @@ func (d *Domain) Fetch(path string, o FetchOpts) (*Media, error) {
 	if o.Bitrate != "" {
 		b.Bitrate = o.Bitrate
 	}
-	mime := sniffMime(abs)
+	mime, binary, err := sniffKind(abs)
+	if err != nil {
+		return nil, err
+	}
 	switch {
 	case strings.HasPrefix(mime, "image/"):
 		return d.fetchImage(abs, mime, b)
@@ -99,6 +100,11 @@ func (d *Domain) Fetch(path string, o FetchOpts) (*Media, error) {
 		return d.fetchAudio(abs, b, seek)
 	case strings.HasPrefix(mime, "video/"), isVideoExt(abs):
 		return d.fetchVideo(abs, b, seek)
+	}
+	// The media door: a plain text document is not the AI's reason to
+	// fetch — it is sent to the text door instead of raw-passthrough.
+	if !binary && !isAudioExt(abs) && !isVideoExt(abs) {
+		return nil, fmt.Errorf("fetch takes media: %q is text (%s) — use read (lines/bytes window)", path, mime)
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {

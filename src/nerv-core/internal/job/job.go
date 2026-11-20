@@ -38,20 +38,20 @@ const (
 	Failed  Status = "failed"
 	// Stuck is the deadlock landing: pending jobs whose inputs can no longer
 	// appear fail as stuck (a circular queue lands here too — no cycle
-	// detection, §2.4).
+	// detection, SPECS §6.3).
 	Stuck Status = "stuck"
 )
 
 // Job is one entry of a submitted queue. The queue file is a bare array of
 // {tool, params} — no top-level envelope (the legacy top-level "gpu-count"
-// key died with the inline-queue era, §4.8): scheduler-relevant values are
+// key died with the inline-queue era, SPECS §4.4): scheduler-relevant values are
 // ordinary params overriding the tool's declared defaults.
 type Job struct {
 	// Tool (required) is the script name relative to tools/ (the ".sh"
 	// suffix may be omitted — the scheduler resolves it).
 	Tool string `json:"tool"`
 	// Params are the tool's parameters; every key must be a declared field
-	// (public or hidden — Check enforces this, §2.3). Values flow to the
+	// (public or hidden — Check enforces this, SPECS §6.2). Values flow to the
 	// script untouched as NERV_<FIELD> env vars.
 	Params map[string]any `json:"params,omitempty"`
 
@@ -72,13 +72,35 @@ func (d Duration) String() string {
 	return d.Duration.Round(time.Second).String()
 }
 
+// MergeDefaults fills a queue line from a template line (the queue file's
+// "defaults" block, SPECS §6.1): top-level fields apply only where the line
+// is silent; params merge key-wise, the line's values winning whole (no
+// splice of maps or arrays).
+func (j *Job) MergeDefaults(d Job) {
+	if j.Tool == "" {
+		j.Tool = d.Tool
+	}
+	if len(d.Params) == 0 {
+		return
+	}
+	if j.Params == nil {
+		j.Params = map[string]any{}
+	}
+	for k, v := range d.Params {
+		if _, ok := j.Params[k]; !ok {
+			j.Params[k] = v
+		}
+	}
+}
+
 // Check validates a queue entry against the tool's declared interface and
 // resolves the io-marked paths in place (params keep the normalized form —
 // what flows to env must match what was checked). It returns the collected
 // output and input paths, plus a skip reason ("" = valid). A skip reason is
 // soft: the entry lands in skipped[{index, tool, reason}], the wave goes on
-// (lenient validation, M12 spirit, §2.3).
-func (j *Job) Check(ti *ToolInfo) (outputs, inputs []string, reason string) {
+// (lenient validation, SPECS §6.2). mount names the active playground domain:
+// a copied "nest/<mount>/" URL prefix folds off io paths.
+func (j *Job) Check(ti *ToolInfo, mount string) (outputs, inputs []string, reason string) {
 	if strings.TrimSpace(j.Tool) == "" {
 		return nil, nil, "'tool' is required"
 	}
@@ -86,7 +108,7 @@ func (j *Job) Check(ti *ToolInfo) (outputs, inputs []string, reason string) {
 		j.Params = map[string]any{}
 	}
 	// Every param key must be a declared field — a typo cannot leak through
-	// into the script as an invented env var (§2.3). Sorted for a
+	// into the script as an invented env var (SPECS §6.2). Sorted for a
 	// deterministic reason on multiple offenders.
 	keys := make([]string, 0, len(j.Params))
 	for k := range j.Params {
@@ -99,7 +121,7 @@ func (j *Job) Check(ti *ToolInfo) (outputs, inputs []string, reason string) {
 		}
 	}
 	// Materialize declared defaults for absent params: what flows to env is
-	// the complete param set (defaults are part of the interface, §2.3).
+	// the complete param set (defaults are part of the interface, SPECS §6.2).
 	for i := range ti.Fields {
 		f := &ti.Fields[i]
 		if _, ok := j.Params[f.Name]; !ok && f.HasDefault {
@@ -122,7 +144,7 @@ func (j *Job) Check(ti *ToolInfo) (outputs, inputs []string, reason string) {
 			continue
 		}
 		var collected []string
-		norm, r := normalizeIO(f.Name, v, f.IO == "out", &collected)
+		norm, r := normalizeIO(f.Name, v, f.IO == "out", mount, &collected)
 		if r != "" {
 			return nil, nil, r
 		}
@@ -145,13 +167,13 @@ func (j *Job) Check(ti *ToolInfo) (outputs, inputs []string, reason string) {
 // e.g. refs); outputs are single-valued — a tool producing several artifacts
 // declares several io:"out" fields, one per file (arrays as outputs were
 // cut as over-engineering).
-func normalizeIO(name string, v any, isOut bool, collected *[]string) (any, string) {
+func normalizeIO(name string, v any, isOut bool, mount string, collected *[]string) (any, string) {
 	switch tv := v.(type) {
 	case string:
 		if tv == "" {
 			return tv, ""
 		}
-		p := NormalizePath(tv)
+		p := NormalizePath(tv, mount)
 		if err := WithinRel(p); err != nil {
 			return v, fmt.Sprintf("field %q: %v", name, err)
 		}
@@ -166,7 +188,7 @@ func normalizeIO(name string, v any, isOut bool, collected *[]string) (any, stri
 			if !ok || sv == "" {
 				continue
 			}
-			p := NormalizePath(sv)
+			p := NormalizePath(sv, mount)
 			if err := WithinRel(p); err != nil {
 				return v, fmt.Sprintf("field %q: %v", name, err)
 			}
@@ -182,7 +204,7 @@ func normalizeIO(name string, v any, isOut bool, collected *[]string) (any, stri
 }
 
 // Require resolves the job's appetite: the param overrides the tool's
-// declared default (the ordinary-field convention, §2.4).
+// declared default (the ordinary-field convention, SPECS §4.4).
 func (j *Job) Require(ti *ToolInfo) int {
 	if v, ok := j.Params[FieldGPURequire]; ok {
 		if n, ok := asInt(v); ok && n >= 0 {

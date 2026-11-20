@@ -34,7 +34,7 @@ import (
 	"nerv-core/internal/gpu"
 )
 
-// waveLog is the per-wave debug log (§2.7): ONE file beside the queue file,
+// waveLog is the per-wave debug log (SPECS §6.6): ONE file beside the queue file,
 // holding jsonl event lines plus every job's streamed stdout+stderr
 // (line-prefixed so parallel jobs stay attributable). It exists only when
 // RunOpts.LogPath is set — the default daemon writes no files at all.

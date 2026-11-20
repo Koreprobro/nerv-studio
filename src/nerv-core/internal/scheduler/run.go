@@ -35,7 +35,7 @@ import (
 
 // runWave runs the wave concurrently, each job on its exclusive slots. A
 // job that exits 0 without having written its declared output fails: the
-// exit code alone is not trusted to mean a file landed (§2.4).
+// exit code alone is not trusted to mean a file landed (SPECS §6.4).
 func (s *Scheduler) runWave(ctx context.Context, wave []*Admitted, onProgress Progress, wl *waveLog) {
 	var wg sync.WaitGroup
 	for _, e := range wave {
@@ -83,9 +83,11 @@ func (s *Scheduler) setStatus(e *Admitted, st job.Status, errMsg string, onProgr
 // runJob executes the script with the contract env. Exit 0 == ok; the
 // script runs in its own process group and ctx cancellation SIGKILLs the
 // whole group (the wrapper sh spawns generator children — killing only the
-// direct child would orphan the GPU process). Output streams into a capped
-// in-memory buffer (the failed-tail source, last ~64 KB, §2.7) and, with a
-// debug wave log, additionally into <index>-<tool-stem>.log.
+// direct child would orphan the GPU process). The job's cwd is the mount
+// root (the playground): relative io paths and $NERV_* resolve to the very
+// files the core checked (SPECS §5). Output streams into a capped
+// in-memory buffer (the failed-tail source, last ~64 KB, SPECS §5) and, with
+// a debug wave log, line-prefixed into that one file (SPECS §6.6).
 func (s *Scheduler) runJob(ctx context.Context, e *Admitted, wl *waveLog) error {
 	if err := s.archiveOld(e); err != nil {
 		return err
@@ -96,6 +98,7 @@ func (s *Scheduler) runJob(ctx context.Context, e *Admitted, wl *waveLog) error 
 		}
 	}
 	cmd := exec.CommandContext(ctx, "sh", filepath.Join(s.Deps.ToolsDir, filepath.FromSlash(e.j.Tool)))
+	cmd.Dir = s.Deps.Artifactory.Root
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 10 * time.Second
@@ -123,7 +126,7 @@ func (s *Scheduler) runJob(ctx context.Context, e *Admitted, wl *waveLog) error 
 }
 
 // cappedWriter keeps only the last capBytes of the stream — an endless
-// generator log must not grow the daemon's memory without bound (§2.7).
+// generator log must not grow the daemon's memory without bound (SPECS §5).
 type cappedWriter struct {
 	capBytes int
 	buf      []byte
@@ -139,7 +142,7 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 
 func (c *cappedWriter) String() string { return string(c.buf) }
 
-// archiveOld is the core's same-name overwrite protection (SPECS §6): an
+// archiveOld is the core's same-name overwrite protection (SPECS §6.5): an
 // existing file the job is about to produce is moved aside to
 // "name-<i>.ext" before the script starts, so the consumer-AI always gets
 // exactly the output name it declared and conflicts resolve in favor of

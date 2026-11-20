@@ -25,11 +25,11 @@ import (
 	"strings"
 )
 
-// Build assembles the frozen pool (REBUILD-nerv-core.md §2.5):
+// Build assembles the frozen pool (SPECS §6.7):
 // greedy scoop of every enumerated backend, filtered by the operator
 // selector (backendSel, the gpu_backend value), plus the declared external
 // slots (externalSpec, the external_gpu value). An absent backend only
-// warns — a CPU-only host must still serve the studio (audit M5 / D4).
+// warns — a CPU-only host must still serve the studio.
 func Build(backendSel, externalSpec string, enums map[string]Enumerator) (*Pool, []string, error) {
 	var warns []string
 	sel, err := ParseSelector(backendSel)
@@ -88,7 +88,7 @@ func Build(backendSel, externalSpec string, enums map[string]Enumerator) (*Pool,
 // ParseExternal parses the external_gpu value: comma-separated
 // backend@host[:N] entries, N default 1. The slots are anonymous: no
 // detection, no health-check — a remote host is just a slot for the
-// scheduler; the transport is the sh developer's concern (§2.5).
+// scheduler; the transport is the sh developer's concern (SPECS §6.7).
 func ParseExternal(value string) ([]Slot, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -126,7 +126,7 @@ func ParseExternal(value string) ([]Slot, error) {
 // PinSet resolves a gpu-pin value (same grammar as the selector) against
 // the pool: the scheduler may take slots only from the returned set
 // ("прибить гвоздями"). An empty value means no pin. A pin that matches
-// nothing is an error — the nail missed the wall (fail-fast, §2.5).
+// nothing is an error — the nail missed the wall (fail-fast, SPECS §6.7).
 func (p *Pool) PinSet(value string) ([]Slot, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {

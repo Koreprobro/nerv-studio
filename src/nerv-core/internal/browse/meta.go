@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,14 +129,8 @@ func SafetensorsMeta(abs string) (map[string]string, error) {
 }
 
 func sniffMime(abs string) string {
-	f, err := os.Open(abs)
-	if err != nil {
-		return "application/octet-stream"
-	}
-	defer f.Close()
-	b := make([]byte, 512)
-	n, _ := f.Read(b)
-	return http.DetectContentType(b[:n])
+	mime, _, _ := sniffKind(abs)
+	return mime
 }
 
 func countLines(abs string) (int, error) {

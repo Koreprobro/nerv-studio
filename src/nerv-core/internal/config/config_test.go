@@ -134,7 +134,7 @@ func TestDomainNameAndPathRules(t *testing.T) {
 	cases := []struct{ body, want string }{
 		{`{"domains": {"art": {"path": "", "commands": ["mount"]}}}`, "path"},
 		{`{"domains": {"bad name": {"path": "x", "commands": ["mount"]}}}`, "name"},
-		{`{"domains": {"gpu.list": {"path": "x", "commands": ["mount"]}}}`, "collides"},
+		{`{"domains": {"dice.roll": {"path": "x", "commands": ["mount"]}}}`, "collides"},
 	}
 	for _, c := range cases {
 		mustWrite(t, filepath.Join(root, "nerv.json"), c.body)

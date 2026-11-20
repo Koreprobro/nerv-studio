@@ -20,55 +20,16 @@
 package mcp
 
 import (
+	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
 	"nerv-core/internal/config"
-	"nerv-core/internal/gpu"
 )
-
-// slotView is one line of the gpu.list diagnostic.
-type slotView struct {
-	Slot  string `json:"slot"`
-	Local bool   `json:"local"`
-	Load  string `json:"load,omitempty"`
-}
-
-// callGPUList is the hidden operator diagnostic: pool slots with a live
-// load read where the backend supports it.
-func (s *Server) callGPUList(_ map[string]any) ToolResult {
-	if s.Pool == nil || len(s.Pool.Slots()) == 0 {
-		return textResult("gpu pool: empty (no backend detected, no external slots)")
-	}
-	var out []slotView
-	for _, sl := range s.Pool.Slots() {
-		v := slotView{Slot: sl.String(), Local: sl.Local()}
-		if sl.Local() && sl.Backend == "cuda" {
-			if kb, err := gpu.QueryLoad(sl); err == nil {
-				v.Load = strconv.FormatUint(kb/1024, 10) + " MiB"
-			}
-		}
-		out = append(out, v)
-	}
-	return textResult(strings.Join(renderSlots(out), "\n"))
-}
-
-func renderSlots(vs []slotView) []string {
-	out := make([]string, 0, len(vs))
-	for _, v := range vs {
-		line := v.Slot
-		if !v.Local {
-			line += " (external)"
-		}
-		if v.Load != "" {
-			line += " load " + v.Load
-		}
-		out = append(out, line)
-	}
-	return out
-}
 
 // guardVolume caps the TEXT surface (max_output_chars); media blocks carry
 // their own budget. Over the cap the answer is refused with the escape
@@ -118,17 +79,56 @@ type rootTag struct{ root, tag string }
 
 // buildRedactions maps the project root and every mounted domain root to a
 // <name> tag, longest root first — a nested root must redact to its own,
-// deeper tag (SPECS §3.7).
+// deeper tag (SPECS §3.6). The system temp dir gets the <tmp> tag: the
+// daemon's transient wave logs live there and can surface in answers.
 func buildRedactions(cfg *config.Config) []rootTag {
-	out := make([]rootTag, 0, len(cfg.Domains)+1)
+	out := make([]rootTag, 0, len(cfg.Domains)+2)
 	if cfg.ProjectRoot != "" {
 		out = append(out, rootTag{filepath.Clean(cfg.ProjectRoot), "<project>"})
+	}
+	if tmp := filepath.Clean(os.TempDir()); tmp != "" && tmp != "/" {
+		out = append(out, rootTag{tmp, "<tmp>"})
 	}
 	for name, d := range cfg.Domains {
 		out = append(out, rootTag{filepath.Clean(d.Path), "<" + name + ">"})
 	}
 	sort.Slice(out, func(i, j int) bool { return len(out[i].root) > len(out[j].root) })
 	return out
+}
+
+// strayAbsPath matches a standalone absolute path token of two or more
+// segments: the leading delimiter excludes URLs ("http://host:9696/art"
+// — ':' and '/' are not start characters), relative "a/b/c" paths (a
+// letter never starts the token) and the tails of tagged paths
+// ("<kb>/a/b.md" — '>' is not a start character either). One-segment
+// tokens ("/etc") stay: too ambiguous to be a path in prose.
+var strayAbsPath = regexp.MustCompile(`(^|[^0-9A-Za-z_./:\\~>-])((?:/[A-Za-z0-9._+~-]+){2,}/?)`)
+
+// scrubStrayPaths is the jail rule of the redactor (SPECS §3.6): with the
+// mounted roots already tagged, any remaining absolute token collapses to
+// <path>/basename — the consumer-AI world knows relative paths and root
+// tags only; full server paths survive exclusively in debug artifacts.
+// /nest/ URLs are the studio's own space and pass through untouched.
+func scrubStrayPaths(msg string) string {
+	return strayAbsPath.ReplaceAllStringFunc(msg, func(m string) string {
+		head := 0
+		if m[0] != '/' {
+			head = 1 // the match carries its leading delimiter
+		}
+		token := m[head:]
+		if strings.HasPrefix(token, "/nest/") {
+			return m
+		}
+		trailing := strings.HasSuffix(token, "/")
+		_, base := path.Split(strings.TrimSuffix(token, "/"))
+		if base == "" {
+			return m[:head] + "<path>"
+		}
+		if trailing {
+			return m[:head] + "<path>/" + base + "/" // keep the dir-ness visible
+		}
+		return m[:head] + "<path>/" + base
+	})
 }
 
 // redact strips server-absolute paths from anything the client sees.
@@ -140,5 +140,21 @@ func (s *Server) redact(msg string) string {
 		msg = strings.ReplaceAll(msg, r.root+"/", r.tag+"/")
 		msg = strings.ReplaceAll(msg, r.root, r.tag)
 	}
-	return msg
+	return scrubStrayPaths(msg)
+}
+
+// redactResult maps server-absolute paths inside the text blocks of a
+// tool result to their root tags. Redaction is enforced at the response
+// boundary (SPECS §3.6): every answer reaching the client — error text,
+// file content (a stamped queue file carries wave-debug tails quoting
+// absolute paths), wave blocks, progress lines — passes through here, so
+// no per-site error formatter can smuggle a raw root in. Media blocks
+// are base64 and pass through untouched.
+func (s *Server) redactResult(res ToolResult) ToolResult {
+	for i := range res.Content {
+		if res.Content[i].Type == "text" {
+			res.Content[i].Text = s.redact(res.Content[i].Text)
+		}
+	}
+	return res
 }

@@ -27,7 +27,7 @@ import (
 
 // probeTool answers `<toolbox> probe <name>`: summary + fields (hidden
 // entries drop silently unless fullRawAccess) + the computed
-// minimal-capacity (§2.5 — the planning number for the consumer, mechanics
+// minimal-capacity (SPECS §6.7 — the planning number for the consumer, mechanics
 // hidden). The toolbox root comes from the domain the call arrived on.
 func (s *Server) probeTool(domain string, args map[string]any) ToolResult {
 	name := asString(args, "path")

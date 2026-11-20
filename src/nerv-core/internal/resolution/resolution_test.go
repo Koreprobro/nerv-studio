@@ -65,6 +65,28 @@ func TestComputeCustomSpec(t *testing.T) {
 	}
 }
 
+// The studio default carries no area ceiling: a big target is a big canvas, and the
+// generator's own limits are the tool's business. An explicit MaxSide still clamps, and a
+// ceiling below the floor collapses to the floor instead of a resurrected default.
+func TestComputeNoCeiling(t *testing.T) {
+	w, h, err := Compute("1:1", Spec{Target: 4_000_000})
+	if err != nil || w != 2016 || h != 2016 {
+		t.Errorf("4 MP 1:1 = %dx%d err %v, want 2016x2016", w, h, err)
+	}
+	w, h, err = Compute("16:9", Spec{Target: 8_000_000})
+	if err != nil || w != 3744 || h != 2112 {
+		t.Errorf("8 MP 16:9 = %dx%d err %v, want 3744x2112", w, h, err)
+	}
+	w, h, err = Compute("1:1", Spec{Target: 8_000_000, MaxSide: 1536})
+	if err != nil || w != 1536 || h != 1536 {
+		t.Errorf("8 MP 1:1 under a 1536 ceiling = %dx%d err %v, want 1536x1536", w, h, err)
+	}
+	w, h, _ = Compute("1:1", Spec{MinSide: 1024, MaxSide: 512})
+	if w != 1024 || h != 1024 {
+		t.Errorf("ceiling under the floor = %dx%d, want 1024x1024", w, h)
+	}
+}
+
 func TestRatioBadInput(t *testing.T) {
 	for _, bad := range []string{"", "  ", "abc", "a:9"} {
 		if _, err := Ratio(bad); err == nil {

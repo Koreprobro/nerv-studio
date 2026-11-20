@@ -84,8 +84,9 @@ func awaitWave(t *testing.T, ts *httptest.Server, id string) map[string]any {
 	}
 }
 
-// The queue-file contract (§2.3, §4.9): a path is the only launch input,
-// a bare JSON array the only file shape.
+// The queue-file contract (SPECS §6.1): a path is the only launch input;
+// file shapes are a JSON array of lines or the {"defaults"?, "jobs", "wave"?}
+// envelope — anything else is rejected before the wave starts.
 func TestExecuteQueueFileContract(t *testing.T) {
 	ts, art := fixture(t)
 	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": []any{map[string]any{"tool": "echo"}}})
@@ -94,8 +95,8 @@ func TestExecuteQueueFileContract(t *testing.T) {
 	}
 	writeQueue(t, art, "envelope.json", `{"queue": [{"tool": "echo"}]}`)
 	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": "envelope.json"})
-	if !res.IsError || !strings.Contains(firstText(res), "bare JSON array") {
-		t.Errorf("envelope file must be rejected: %s", firstText(res))
+	if !res.IsError || !strings.Contains(firstText(res), `envelope needs`) {
+		t.Errorf("envelope without jobs must be rejected: %s", firstText(res))
 	}
 	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": "ghost.json"})
 	if !res.IsError || !strings.Contains(firstText(res), "queue file") {
@@ -116,10 +117,100 @@ func TestExecuteQueueFileContract(t *testing.T) {
 	}
 }
 
+// A queue SET (SPECS §6.1): a comma-separated list of queue files merges
+// in list order into one wave — the elephant is eaten in parts.
+func TestExecuteQueueSet(t *testing.T) {
+	ts, art := fixture(t)
+	rel1 := writeQueue(t, art, "q1.json", `[{"tool":"echo","params":{"text":"one","output":"p1.txt"}}]`)
+	rel2 := writeQueue(t, art, "q2.json", `[{"tool":"echo","params":{"text":"two","output":"p2.txt"}},
+	                                       {"tool":"echo","params":{"text":"three","output":"p3.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel1 + ", " + rel2})
+	if res.IsError {
+		t.Fatalf("set launch: %s", firstText(res))
+	}
+	fin := awaitWave(t, ts, waveIDOf(t, res))
+	if fin["ok"] != true {
+		t.Errorf("set wave must be ok: %v", fin)
+	}
+	if n := len(fin["jobs"].([]any)); n != 3 {
+		t.Errorf("merged wave must carry all 3 jobs: %v", fin["jobs"])
+	}
+	for _, f := range []struct{ name, want string }{{"p1.txt", "one"}, {"p2.txt", "two"}, {"p3.txt", "three"}} {
+		if b, err := os.ReadFile(filepath.Join(art, f.name)); err != nil || string(b) != f.want {
+			t.Errorf("%s: %v %q", f.name, err, b)
+		}
+	}
+	// a broken member rejects the whole set by name, before any wave starts
+	writeQueue(t, art, "q3.json", `[{"tool":"echo"}`)
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel1 + ",q3.json"})
+	if !res.IsError || !strings.Contains(firstText(res), "q3.json") {
+		t.Errorf("broken member must name the file: %s", firstText(res))
+	}
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "wave": "latest"})
+	if res.IsError {
+		t.Errorf("failed set launch must not open a wave (latest must stay the merged one): %s", firstText(res))
+	}
+}
+
+// check dry-runs a queue set (SPECS §6.1): the same reader and admission
+// as execute, but nothing launches — counts per file, would-be-skipped
+// lines named, no wave in the ledger.
+func TestCheckQueue(t *testing.T) {
+	ts, art := fixture(t)
+	rel1 := writeQueue(t, art, "c1.json", `[{"tool":"echo","params":{"text":"one","output":"c1.txt"}}]`)
+	rel2 := writeQueue(t, art, "c2.json", `[{"tool":"ghost","params":{"output":"c2.txt"}},
+	                                       {"tool":"echo","params":{"output":"c2b.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "check", "queue": rel1 + ", " + rel2})
+	if res.IsError {
+		t.Fatalf("check of a valid set: %s", firstText(res))
+	}
+	var rep struct {
+		Files []struct {
+			File string
+			Jobs int
+		} `json:"files"`
+		Jobs     int `json:"jobs"`
+		Admitted int `json:"admitted"`
+		Skipped  []struct {
+			Tool   string `json:"tool"`
+			Reason string `json:"reason"`
+		} `json:"skipped"`
+	}
+	if err := json.Unmarshal([]byte(firstText(res)), &rep); err != nil {
+		t.Fatalf("check answer is not JSON: %v — %s", err, firstText(res))
+	}
+	if rep.Jobs != 3 || rep.Admitted != 2 || len(rep.Skipped) != 1 || rep.Skipped[0].Tool != "ghost" {
+		t.Errorf("check report wrong: %s", firstText(res))
+	}
+	if len(rep.Files) != 2 || rep.Files[0].Jobs != 1 || rep.Files[1].Jobs != 2 {
+		t.Errorf("per-file counts wrong: %s", firstText(res))
+	}
+	// nothing ran and no wave opened
+	if _, err := os.Stat(filepath.Join(art, "c1.txt")); !os.IsNotExist(err) {
+		t.Errorf("check must not run jobs: c1.txt exists")
+	}
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "wave": "latest"})
+	if !res.IsError {
+		t.Errorf("check must not open a wave: %s", firstText(res))
+	}
+	// a broken member answers isError and names the file
+	writeQueue(t, art, "c3.json", `{"tool":"echo"}`) // object envelope, not a bare array
+	res, _ = call(t, ts, "tools", map[string]any{"command": "check", "queue": rel1 + ",c3.json"})
+	if !res.IsError || !strings.Contains(firstText(res), "c3.json") {
+		t.Errorf("broken member must be named: %s", firstText(res))
+	}
+	// all lines unsuitable: execute would refuse, so check answers isError with the list
+	writeQueue(t, art, "c4.json", `[{"tool":"ghost","params":{"output":"c4.txt"}}]`)
+	res, _ = call(t, ts, "tools", map[string]any{"command": "check", "queue": "c4.json"})
+	if !res.IsError || !strings.Contains(firstText(res), "ghost") {
+		t.Errorf("zero-admission set must be isError with skipped: %s", firstText(res))
+	}
+}
+
 func TestExecuteWaveArtifacts(t *testing.T) {
 	ts, art := fixture(t)
 	q := `[{"tool":"echo","params":{"text":"one","output":"a.txt"}},
-	       {"tool":"echo","params":{"text":"two","output":"artifacts/b.txt"}},
+	       {"tool":"echo","params":{"text":"two","output":"nest/artifactory/b.txt"}},
 	       {"tool":"ghost","params":{"output":"x.txt"}}]`
 	rel := writeQueue(t, art, "q.json", q)
 	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
@@ -135,7 +226,7 @@ func TestExecuteWaveArtifacts(t *testing.T) {
 	if fin["ok"] != true {
 		t.Errorf("wave must be ok: %s", txt)
 	}
-	if !strings.Contains(string(txt), `"/artifacts/a.txt"`) {
+	if !strings.Contains(string(txt), `"/nest/artifactory/a.txt"`) {
 		t.Errorf("artifactURL missing: %s", txt)
 	}
 	if !strings.Contains(string(txt), `"dur"`) {
@@ -144,7 +235,7 @@ func TestExecuteWaveArtifacts(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(art, "b.txt")); err != nil || string(b) != "two" {
 		t.Errorf("normalized output not on disk: %v %q", err, b)
 	}
-	resp, err := http.Get(ts.URL + "/artifacts/a.txt")
+	resp, err := http.Get(ts.URL + "/nest/artifactory/a.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,9 +311,11 @@ func mustLookup(t *testing.T, ts *httptest.Server, view map[string]any) ToolResu
 	return res
 }
 
-// Blocking mode without a progressToken answers plain JSON when the wave
-// ends (§2.3); with a token the same wave streams SSE (TestExecuteSSE).
-func TestExecuteBlockingPlainJSON(t *testing.T) {
+// Blocking mode without a progressToken still answers over one SSE stream
+// (SPECS §6.6): headers flush before the wave, the final response is the
+// stream's last event; with a token the same stream also carries progress
+// (TestExecuteSSE).
+func TestExecuteBlockingNoToken(t *testing.T) {
 	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) { cfg.LLMOffload = true }, cudaPool(1))
 	writeTool(t, filepath.Join(filepath.Dir(art), "tools"), "gpuecho.sh",
 		`{"summary":"one cuda gpu","fields":[{"name":"text","required":true},{"name":"output","io":"out"},
@@ -242,7 +335,39 @@ func TestExecuteBlockingPlainJSON(t *testing.T) {
 	}
 }
 
-// Async ownership (§2.3): the launch answer returns before the wave ends
+// F2: the volume guard caps both transports (SPECS §3.5) — a blocking wave
+// answering over the SSE stream hits the cap on the final event too, and the
+// full dump stays one reshoot-free lookup away.
+func TestVolumeGuardSSE(t *testing.T) {
+	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) {
+		cfg.LLMOffload = true
+		cfg.MaxOutputChars = 64
+	}, cudaPool(1))
+	writeTool(t, filepath.Join(filepath.Dir(art), "tools"), "gpuecho.sh",
+		`{"summary":"one cuda gpu","fields":[{"name":"text","required":true},{"name":"output","io":"out"},
+		   {"name":"gpu-require","default":1},{"name":"gpu-backend","default":"cuda"}]}`,
+		`printf '%s' "$NERV_TEXT" > "$NERV_OUTPUT"`)
+	rel := writeQueue(t, art, "q.json", `[{"tool":"gpuecho","params":{"text":"gpu","output":"g.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	txt := firstText(res)
+	if !strings.Contains(txt, "[volume guard") {
+		t.Fatalf("streamed wave result must hit the volume guard: %q", txt)
+	}
+	if !strings.Contains(txt, `execute wave="`) {
+		t.Errorf("guard must point at the reshoot-free wave lookup: %q", txt)
+	}
+	// The lookup is guarded as well; volume_ack lifts the cap.
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "wave": "latest"})
+	if !strings.Contains(firstText(res), "[volume guard") {
+		t.Errorf("wave lookup must be guarded too: %q", firstText(res))
+	}
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "wave": "latest", "volume_ack": true})
+	if res.IsError || !strings.Contains(firstText(res), "finished") {
+		t.Errorf("volume_ack must lift the cap: %q", firstText(res))
+	}
+}
+
+// Async ownership (SPECS §6.6): the launch answer returns before the wave ends
 // and the wave keeps running after the launching request is gone.
 func TestExecuteAsyncSurvivesDisconnect(t *testing.T) {
 	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) { cfg.LLMOffload = true }, nil)
@@ -264,7 +389,7 @@ func TestExecuteAsyncSurvivesDisconnect(t *testing.T) {
 	}
 }
 
-// Ledger (§2.2): exact ids resolve, "latest" is the consumer view —
+// Ledger (SPECS §6.1): exact ids resolve, "latest" is the consumer view —
 // raw-tagged waves hide from it and reappear under fullRawAccess.
 func TestWaveLedgerLatestAndTag(t *testing.T) {
 	ts, art := fixture(t)
@@ -293,29 +418,180 @@ func TestWaveLedgerLatestAndTag(t *testing.T) {
 	}
 }
 
-// Debug wave logs through the surface (§2.7): --debug adds the log pointer,
-// the file lands beside the queue file, and a second wave of the same queue
-// rotates the old log out through the archive mechanism.
+// Debug folds into the queue file (SPECS §6.6): --debug runs the wave log
+// in the system temp dir and folds its tail into the queue file's wave
+// block; the playground gets no stray .log files, and a reshoot simply
+// restamps the block.
 func TestDebugWaveLogs(t *testing.T) {
 	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) { cfg.Debug = true }, nil)
 	rel := writeQueue(t, art, "q.json", `[{"tool":"echo","params":{"text":"d","output":"dbg.txt"}}]`)
 	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
-	v := viewJSON(t, res)
-	if v["log"] != "q.log" {
-		t.Fatalf("log pointer wrong: %s", firstText(res))
+	id := waveIDOf(t, res)
+	awaitWave(t, ts, id)
+	w := readWaveBlock(t, art, "q.json")
+	if dbg, _ := w["debug"].(string); !strings.Contains(dbg, `"event":"end"`) {
+		t.Errorf("debug tail not folded into the queue file: %.200v", w["debug"])
 	}
-	awaitWave(t, ts, waveIDOf(t, res))
-	first, err := os.ReadFile(filepath.Join(art, "q.log"))
+	if _, err := os.Stat(filepath.Join(art, "q.log")); !os.IsNotExist(err) {
+		t.Errorf("playground wave log must be gone: %v", err)
+	}
+	// Reshoot: the block is replaced in place, nothing rotates.
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	id2 := waveIDOf(t, res)
+	awaitWave(t, ts, id2)
+	if w2 := readWaveBlock(t, art, "q.json"); w2["wave"] != id2 {
+		t.Errorf("reshoot must restamp the block: %v", w2["wave"])
+	}
+	if _, err := os.Stat(filepath.Join(art, "q-1.log")); !os.IsNotExist(err) {
+		t.Errorf("no rotation files beside the queue: %v", err)
+	}
+}
+
+// readWaveBlock parses the wave block the daemon stamped into a queue file.
+func readWaveBlock(t *testing.T, art, rel string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(art, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(first), `"event":"end"`) {
-		t.Errorf("wave log incomplete: %s", first)
+	var obj struct {
+		Wave map[string]any `json:"wave"`
 	}
-	// Second wave on the same queue: the old log must archive to q-1.log.
-	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("queue file after wave: %v (%s)", err, raw)
+	}
+	if obj.Wave == nil {
+		t.Fatalf("no wave block in queue file: %s", raw)
+	}
+	return obj.Wave
+}
+
+// The envelope form of a queue file (SPECS §6.1): defaults merge into every
+// line — the tool fills silences, params merge key-wise with the line's
+// values winning whole.
+func TestQueueEnvelopeDefaults(t *testing.T) {
+	ts, art := fixture(t)
+	writeQueue(t, art, "env.json", `{
+	  "defaults": {"tool": "echo", "params": {"text": "shared"}},
+	  "jobs": [{"params": {"output": "e1.txt"}},
+	           {"params": {"text": "own", "output": "e2.txt"}}]}`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": "env.json"})
+	if res.IsError {
+		t.Fatalf("envelope execute: %s", firstText(res))
+	}
 	awaitWave(t, ts, waveIDOf(t, res))
-	if _, err := os.Stat(filepath.Join(art, "q-1.log")); err != nil {
-		t.Errorf("old wave log not rotated: %v", err)
+	for name, want := range map[string]string{"e1.txt": "shared", "e2.txt": "own"} {
+		b, err := os.ReadFile(filepath.Join(art, name))
+		if err != nil || string(b) != want {
+			t.Errorf("%s = %q (%v), want %q", name, b, err, want)
+		}
+	}
+}
+
+// The wave block lands back in the queue file (SPECS §6.1): the bare array
+// is promoted to the envelope, verdict and sub-ledger ride in "wave", and
+// resubmitting the stamped file reshoots the same recipe (the block is
+// ignored on read).
+func TestWaveBlockWriteBack(t *testing.T) {
+	ts, art := fixture(t)
+	rel := writeQueue(t, art, "q.json", `[{"tool":"echo","params":{"text":"a","output":"wb.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	id := waveIDOf(t, res)
+	awaitWave(t, ts, id)
+	w := readWaveBlock(t, art, "q.json")
+	if w["wave"] != id || w["ok"] != true {
+		t.Errorf("wave block verdict: %v", w)
+	}
+	jobs, _ := w["jobs"].([]any)
+	if len(jobs) != 1 {
+		t.Fatalf("sub-ledger size: %v", w["jobs"])
+	}
+	j0, _ := jobs[0].(map[string]any)
+	if j0["status"] != "done" || j0["index"].(float64) != 0 {
+		t.Errorf("sub-ledger line: %v", j0)
+	}
+	// The recipe survives the stamp: the stamped file reshoots as a fresh wave.
+	res, _ = call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	id2 := waveIDOf(t, res)
+	if id2 == id {
+		t.Fatal("reshoot must start a fresh wave")
+	}
+	awaitWave(t, ts, id2)
+	if w2 := readWaveBlock(t, art, "q.json"); w2["wave"] != id2 {
+		t.Errorf("reshoot must restamp the queue file: %v", w2)
+	}
+}
+
+// A multi-file wave stamps every file with the shared wave id and its own
+// sub-ledger on local indexes (SPECS §6.1).
+func TestWaveBlockSubLedgers(t *testing.T) {
+	ts, art := fixture(t)
+	q1 := writeQueue(t, art, "s1.json", `[{"tool":"echo","params":{"text":"a","output":"s1a.txt"}},{"tool":"echo","params":{"text":"b","output":"s1b.txt"}}]`)
+	q2 := writeQueue(t, art, "s2.json", `[{"tool":"echo","params":{"text":"c","output":"s2a.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": q1 + "," + q2})
+	id := waveIDOf(t, res)
+	awaitWave(t, ts, id)
+	w1 := readWaveBlock(t, art, "s1.json")
+	w2 := readWaveBlock(t, art, "s2.json")
+	if w1["wave"] != id || w2["wave"] != id {
+		t.Fatalf("both files must carry the shared wave id: %v / %v", w1["wave"], w2["wave"])
+	}
+	l1, _ := w1["jobs"].([]any)
+	l2, _ := w2["jobs"].([]any)
+	if len(l1) != 2 || len(l2) != 1 {
+		t.Fatalf("sub-ledgers split by file: %d / %d", len(l1), len(l2))
+	}
+	if line, _ := l2[0].(map[string]any); line["index"].(float64) != 0 {
+		t.Errorf("sub-ledger indexes are file-local: %v", l2[0])
+	}
+}
+
+// POST /wave/stop — the red button (SPECS §6.6): it cancels the live wave,
+// the queue file still receives its wave block, and pressing again answers
+// idempotently.
+func TestWaveStopEndpoint(t *testing.T) {
+	ts, art, _ := fixtureTweak(t, func(cfg *config.Config) { cfg.LLMOffload = true }, nil)
+	writeTool(t, filepath.Join(filepath.Dir(art), "tools"), "slow2.sh",
+		`{"summary":"sleeps long","fields":[{"name":"output","io":"out"}]}`,
+		`sleep 30; printf late > "$NERV_OUTPUT"`)
+	rel := writeQueue(t, art, "q.json", `[{"tool":"slow2","params":{"output":"never.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	if res.IsError {
+		t.Fatalf("async launch: %s", firstText(res))
+	}
+	id := waveIDOf(t, res)
+	time.Sleep(150 * time.Millisecond) // let the runner pick the wave up
+	resp, err := http.Post(ts.URL+"/wave/stop", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if body["stopped"] != true || body["wave"] != id {
+		t.Fatalf("stop answer: %v", body)
+	}
+	fin := awaitWave(t, ts, id)
+	if fin["ok"] == true {
+		t.Errorf("stopped wave must be not-ok: %v", fin)
+	}
+	// Idempotence: the wave is over, the button answers without harm.
+	resp, err = http.Post(ts.URL+"/wave/stop", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = nil
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if body["stopped"] != false {
+		t.Errorf("stop after finish must be idempotent: %v", body)
+	}
+	// The queue file carries the cancelled wave block.
+	if w := readWaveBlock(t, art, "q.json"); w["wave"] != id || w["ok"] == true {
+		t.Errorf("cancelled wave block: %v", w)
 	}
 }

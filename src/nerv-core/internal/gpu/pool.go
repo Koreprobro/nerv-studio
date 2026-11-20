@@ -17,8 +17,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Package gpu builds the scheduler's typed slot pool (REBUILD-nerv-core.md
-// §2.5): greedy scoop of everything detected, one operator selector
+// Package gpu builds the scheduler's typed slot pool (SPECS
+// §6.7): greedy scoop of everything detected, one operator selector
 // (gpu_backend), anonymous remote slots (external_gpu) and the tool pin
 // resolution (gpu-pin). VRAM is intentionally not accounted — Name/MemMB are
 // informational; the sh author owns memory. Backend names are opaque
@@ -85,7 +85,7 @@ func (p *Pool) Backends() []string {
 func (p *Pool) Count(backend string) int { return len(p.byBackend[backend]) }
 
 // MinCount returns the smallest per-backend slot count — the safe capacity
-// basis for a tool declaring backend "any" (§2.5). Empty pool => 0.
+// basis for a tool declaring backend "any" (SPECS §6.7). Empty pool => 0.
 func (p *Pool) MinCount() int {
 	min := -1
 	for _, n := range p.byBackend {

@@ -32,7 +32,7 @@ import (
 )
 
 // PinEnv maps a backend to the env var its tools honor for device pinning
-// (§2.5). An unknown backend has no pin env: the scheduler leaves the env
+// (SPECS §5). An unknown backend has no pin env: the scheduler leaves the env
 // untouched and the script stays the authority (opaque names, zero
 // hardcoding).
 func PinEnv(backend string) (string, bool) {
@@ -47,7 +47,7 @@ func PinEnv(backend string) (string, bool) {
 	return "", false
 }
 
-// DefaultEnumerators is the greedy-scoop backend table (§2.5). An
+// DefaultEnumerators is the greedy-scoop backend table (SPECS §6.7). An
 // enumerator returning an error means "backend absent on this host" — the
 // pool simply proceeds without it (a warning is surfaced at startup).
 func DefaultEnumerators() map[string]Enumerator {
@@ -59,8 +59,7 @@ func DefaultEnumerators() map[string]Enumerator {
 }
 
 // ListNVIDIA enumerates local NVIDIA cards via nvidia-smi. The detected
-// device index is kept as-is (no re-indexing; SPECS §3.2 visible/physical
-// dance is retired, REBUILD §4.19).
+// device index is kept as-is (no re-indexing, SPECS §6.7).
 func ListNVIDIA() ([]Slot, error) {
 	out, err := exec.Command("nvidia-smi",
 		"--query-gpu=index,memory.total,name",
@@ -100,39 +99,81 @@ func parseNVIDIA(out string) ([]Slot, error) {
 	return res, nil
 }
 
-// ListROCm enumerates local AMD cards from sysfs (vendor 0x1002 under
-// /sys/class/drm/card*/device), no rocminfo dependency. VRAM total is read
-// when available — informational only.
+// ListROCm enumerates local AMD cards via rocm-smi — a mainstream-runtime
+// probe, mirroring ListNVIDIA. A card the ROCm userspace does not report is
+// not a slot: display-only or unsupported cards (amdgpu on the desktop, no
+// ROCm stack on the host) stay out of the pool. VRAM totals are decorated
+// from sysfs when available — informational only.
 func ListROCm() ([]Slot, error) {
-	matches, err := filepath.Glob("/sys/class/drm/card[0-9]*/device/vendor")
+	out, err := exec.Command("rocm-smi", "--showproductname", "--format=csv").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("rocm-smi: %w", err)
+	}
+	res, err := parseROCm(string(out))
 	if err != nil {
 		return nil, err
+	}
+	readROCmVram(res)
+	return res, nil
+}
+
+// parseROCm reads rocm-smi CSV rows "card<N>, <Product Name>" (pure, test
+// seam). Header, banner and noise lines are skipped. Slot indices are
+// sequential in enumeration order — the order HIP_VISIBLE_DEVICES pins on.
+func parseROCm(out string) ([]Slot, error) {
+	var res []Slot
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		head, rest, ok := strings.Cut(strings.TrimSpace(sc.Text()), ",")
+		if !ok {
+			continue
+		}
+		if _, err := strconv.Atoi(strings.TrimPrefix(head, "card")); err != nil {
+			continue // header, banner, blank
+		}
+		name := strings.Trim(strings.TrimSpace(rest), "\"")
+		if name == "" {
+			name = "amdgpu"
+		}
+		res = append(res, Slot{Backend: "rocm", Index: len(res), Name: name})
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(res) == 0 {
+		return nil, errors.New("rocm-smi: no GPUs reported")
+	}
+	return res, nil
+}
+
+// readROCmVram best-effort decorates slots with sysfs VRAM totals, matched
+// to rocm-smi rows by sorted AMD card order. Informational — never
+// accounting (SPECS §6.7).
+func readROCmVram(slots []Slot) {
+	matches, err := filepath.Glob("/sys/class/drm/card[0-9]*/device/vendor")
+	if err != nil {
+		return
 	}
 	var cards []string
 	for _, m := range matches {
 		v, err := os.ReadFile(m)
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(string(v)) == "0x1002" {
+		if err == nil && strings.TrimSpace(string(v)) == "0x1002" {
 			cards = append(cards, filepath.Dir(m))
 		}
 	}
 	sort.Strings(cards)
-	var res []Slot
-	for i, dir := range cards {
-		s := Slot{Backend: "rocm", Index: i, Name: "amdgpu"}
-		if b, err := os.ReadFile(filepath.Join(dir, "mem_info_vram_total")); err == nil {
-			if bytes, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil {
-				s.MemMB = bytes / (1 << 20)
-			}
+	for i := range slots {
+		if i >= len(cards) {
+			return
 		}
-		res = append(res, s)
+		b, err := os.ReadFile(filepath.Join(cards[i], "mem_info_vram_total"))
+		if err != nil {
+			continue
+		}
+		if bytes, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil {
+			slots[i].MemMB = bytes / (1 << 20)
+		}
 	}
-	if len(res) == 0 {
-		return nil, errors.New("sysfs: no AMD (vendor 0x1002) card found")
-	}
-	return res, nil
 }
 
 // ListIntel enumerates local Intel GPUs via sycl-ls (level_zero devices).
@@ -158,8 +199,8 @@ func ListIntel() ([]Slot, error) {
 }
 
 // QueryLoad reports used memory (MB) of a local NVIDIA slot — a courtesy
-// for the hidden gpu.list diagnostic only, not scheduler accounting.
-// Other backends and remote slots report unsupported.
+// for the wave-to-chat VRAM drain (SPECS §8) only, not scheduler
+// accounting. Other backends and remote slots report unsupported.
 func QueryLoad(s Slot) (uint64, error) {
 	if s.Backend != "cuda" || !s.Local() {
 		return 0, fmt.Errorf("load query not supported for slot %s", s)

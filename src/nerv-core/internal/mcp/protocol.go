@@ -19,9 +19,10 @@
 
 // Package mcp is the only network surface of the daemon: streamable HTTP
 // JSON-RPC (MCP) at /mcp plus the /artifacts/ file mount. The tool list
-// is fixed by REBUILD §2.2 — kb, artifactory, tools, loras, dice.roll,
-// calc.resolution, execute — four domain tools over one browse mechanism
-// and three utilities; gpu.list stays hidden (operator diagnostics).
+// is generated from the config (SPECS §3.2) — kb, artifactory, tools,
+// loras, dice.roll, calc.resolution, execute — four domain tools over one
+// browse mechanism
+// and two utilities.
 package mcp
 
 import (

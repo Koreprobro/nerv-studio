@@ -23,11 +23,15 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"nerv-core/internal/browse"
 	"nerv-core/internal/config"
 	"nerv-core/internal/gpu"
+	"nerv-core/internal/job"
 	"nerv-core/internal/llm"
 	"nerv-core/internal/scheduler"
 	"nerv-core/internal/store"
@@ -52,7 +56,7 @@ type Server struct {
 	LLM        *llm.Client                     // nil when llm_offload is false
 	domains    map[string]*browse.Domain
 	redactions []rootTag // server roots -> <name> tags, longest root first
-	// Wave pipeline (M15): the runner goroutine executes waves FIFO —
+	// Wave pipeline (SPECS §6.6): the runner goroutine executes waves FIFO —
 	// daemon-wide one wave at a time (the serialization dispatchMu used
 	// to provide). The ledger remembers recent waves for {wave: ...}
 	// lookups; waveCtx owns everything a client may not kill.
@@ -97,15 +101,50 @@ func New(cfg *config.Config, pool *gpu.Pool, scheds map[string]*scheduler.Schedu
 	return s
 }
 
-// Handler is the mounted surface: POST /mcp (streamable JSON-RPC) and the
-// /artifacts/ read mount backing artifactURL links (the playground root).
+// Handler is the mounted surface: POST /mcp (streamable JSON-RPC),
+// POST /wave/stop (the red button outside MCP, SPECS §6.6) and
+// GET /nest/<domain>/<rel> — the file mount backing artifactURL links for
+// every domain (SPECS §3.1).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", s.handleRPC)
-	mount := "/artifacts/"
-	mux.Handle(mount, http.StripPrefix(mount,
-		http.FileServer(http.Dir(s.Store.Root))))
+	mux.HandleFunc("POST /wave/stop", s.handleWaveStop)
+	mux.HandleFunc("GET /nest/", s.handleNest)
 	return mux
+}
+
+// handleNest serves GET /nest/<domain>/<rel>: the domain name is always
+// spelled out, so a copied URL never shadows another mount. The
+// execute-granted toolboxes mask their files (a toolbox is capabilities,
+// not files, SPECS §3.7); directories answer 404 — browse is the MCP layer's
+// job, this mount is a file server.
+func (s *Server) handleNest(w http.ResponseWriter, r *http.Request) {
+	domain, rel, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/nest/"), "/")
+	if !ok || rel == "" {
+		http.NotFound(w, r)
+		return
+	}
+	d, known := s.domains[domain]
+	if !known || !s.nestable(domain) {
+		http.NotFound(w, r)
+		return
+	}
+	if err := job.WithinRel(rel); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	full := filepath.Join(d.Root, filepath.FromSlash(rel))
+	if st, err := os.Stat(full); err != nil || st.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, full)
+}
+
+// nestable reports whether a domain's files carry a public /nest URL: every
+// domain but the execute-granted toolboxes, the playground always (SPECS §3.1).
+func (s *Server) nestable(domain string) bool {
+	return domain == s.Mount || !hasAny(s.Cfg.Domains[domain].Commands, "execute")
 }
 
 func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
@@ -218,13 +257,13 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request, req rpcReque
 	if streamed {
 		return
 	}
-	res = s.guardVolume(res, p.Arguments)
+	res = s.guardVolume(s.redactResult(res), p.Arguments)
 	writeResult(w, req.ID, res)
 }
 
 // lookup resolves the tool name: every configured domain is a tool whose
 // allow-list defines its commands (SPECS §3.7); the utilities are the fixed
-// remainder. The hidden gpu.list is reachable but never listed (§2.2).
+// remainder.
 func (s *Server) lookup(name string) (toolHandler, error) {
 	if _, ok := s.domains[name]; ok {
 		return s.domainHandler(name), nil
@@ -238,21 +277,23 @@ func (s *Server) lookup(name string) (toolHandler, error) {
 		return func(w http.ResponseWriter, _ *http.Request, _ rpcRequest, a, _ map[string]any) (ToolResult, bool) {
 			return s.callCalcResolution(a), false
 		}, nil
-	case "gpu.list":
-		return func(w http.ResponseWriter, _ *http.Request, _ rpcRequest, a, _ map[string]any) (ToolResult, bool) {
-			return s.callGPUList(a), false
-		}, nil
 	}
 	return nil, &unknownTool{name}
 }
 
 // domainHandler routes one domain tool call: the execute grant turns
-// {command:"execute"} into the wave launch over this domain's toolbox,
-// everything else runs over the shared browse mechanism.
+// {command:"execute"} into the wave launch over this domain's toolbox and
+// {command:"check"} into its dry run (SPECS §6.1); everything else runs
+// over the shared browse mechanism.
 func (s *Server) domainHandler(name string) toolHandler {
 	return func(w http.ResponseWriter, r *http.Request, req rpcRequest, args, meta map[string]any) (ToolResult, bool) {
-		if hasAny(s.Cfg.Domains[name].Commands, "execute") && asString(args, "command") == "execute" {
-			return s.callExecute(name, w, r, req, args, meta)
+		if hasAny(s.Cfg.Domains[name].Commands, "execute") {
+			switch asString(args, "command") {
+			case "execute":
+				return s.callExecute(name, w, r, req, args, meta)
+			case "check":
+				return s.callCheck(name, args), false
+			}
 		}
 		return s.callDomain(name, args), false
 	}

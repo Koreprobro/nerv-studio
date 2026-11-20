@@ -33,14 +33,17 @@ import (
 
 // buildEnv assembles the slim scheduler↔sh contract (SPECS §5): PATH, pin
 // env for the captured local slots, the operator env, then one NERV_<FIELD>
-// per effective param. Both io marks arrive ABSOLUTE (the core resolves
-// every file field against the artifactory — outputs are additionally
-// archived and their parent dir created before the script starts); plain
-// fields flow verbatim, arrays comma-join. The directory roots left the
-// contract: dirname "$0" is the tools dir, the kb is the chat's domain, the
-// lora dir is operator env. Scheduler-consumed fields (gpu-require /
-// gpu-backend / gpu-pin) never reach the script env. A tool that declared
-// the calculator pair gets NERV_CALCULATED_WIDTH/HEIGHT (SPECS §7.3).
+// per effective param. Both io marks arrive playground-relative (io:"in"
+// too: the script may open them directly) — the launched script's cwd is the
+// mount root, so a relative path resolves to the very file the core checked
+// and can be handed to ffmpeg/sd-cli as-is from inside the playground;
+// io:"out" additionally carries the core's guarantees — an old same-name
+// file moved aside, parent directory created. Plain fields flow verbatim,
+// arrays comma-join. The directory roots left the contract: dirname "$0" is
+// the tools dir, the kb is the chat's domain, the lora dir is operator env.
+// Scheduler-consumed fields (gpu-require / gpu-backend / gpu-pin) never
+// reach the script env. A tool that declared the calculator pair gets
+// NERV_CALCULATED_WIDTH/HEIGHT (SPECS §7.3).
 func (s *Scheduler) buildEnv(e *Admitted) ([]string, error) {
 	// An explicit PATH: the daemon's own environment may be sparse (systemd
 	// / kiosk launches) — without PATH the tool's generator binaries would
@@ -53,7 +56,7 @@ func (s *Scheduler) buildEnv(e *Admitted) ([]string, error) {
 	// Pin env for the captured LOCAL slots only: a remote host is reached by
 	// the script's own transport, a device selector of this machine would
 	// only lie to it. Typed slots need no re-indexing: slot.Index is the
-	// physical id already (§2.5 — the legacy visible/physical hangover dies).
+	// physical id already (SPECS §6.7).
 	var order []string
 	byBackend := map[string][]string{}
 	for _, sl := range e.slots {
@@ -82,13 +85,9 @@ func (s *Scheduler) buildEnv(e *Admitted) ([]string, error) {
 	sort.Strings(keys)
 	for _, k := range keys {
 		if job.SchedulerFields[k] {
-			continue // the scheduler consumed it at admission (§5.1)
+			continue // the scheduler consumed it at admission (SPECS §5.1)
 		}
-		v := e.j.Params[k]
-		if e.outFields[k] || e.inFields[k] {
-			v = absolutize(v, s.Deps.Artifactory.Root)
-		}
-		env = append(env, job.EnvName(k)+"="+stringify(v))
+		env = append(env, job.EnvName(k)+"="+stringify(e.j.Params[k]))
 	}
 	if e.calc {
 		w, h, err := computedSides(e.j.Params)
@@ -102,7 +101,7 @@ func (s *Scheduler) buildEnv(e *Admitted) ([]string, error) {
 	return env, nil
 }
 
-// declaresCalcPair is the §7.3 trigger: the tool declares BOTH calculator
+// declaresCalcPair is the SPECS §7.3 trigger: the tool declares BOTH calculator
 // fields. Comparison is normalized — aspect-ratio and aspect_ratio spellings
 // are the same env name, so both are triggers.
 func declaresCalcPair(ti *job.ToolInfo) bool {
@@ -154,28 +153,6 @@ func asFloat(v any) (float64, bool) {
 		return float64(n), true
 	}
 	return 0, false
-}
-
-// absolutize turns a declared io path into an absolute target (the queue
-// and the wave answer keep the relative form — lineage lives in relative
-// paths; only the script env is absolute). io:"out" fields are single-valued
-// by contract; io:"in" arrays keep their relative form inside the queue and
-// comma-join absolute paths into the env string.
-func absolutize(v any, root string) any {
-	switch t := v.(type) {
-	case string:
-		if t != "" {
-			return root + "/" + t
-		}
-		return t
-	case []any:
-		out := make([]any, 0, len(t))
-		for _, el := range t {
-			out = append(out, absolutize(el, root))
-		}
-		return out
-	}
-	return v
 }
 
 // stringify converts a JSON-decoded param value to its env-string form.

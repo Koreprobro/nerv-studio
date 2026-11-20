@@ -20,7 +20,7 @@
 // Package config resolves the daemon runtime configuration: a flat JSON
 // config file (nerv.json at the project root, or --config) with explicitly
 // passed CLI flags overriding it, over built-in defaults
-// (REBUILD-nerv-core.md §2.1).
+// (SPECS §2.1).
 //
 // Path anchoring: relative directory paths (from file or flags) are resolved
 // against the project root — dirname(dirname(binary)), never the process
@@ -54,8 +54,7 @@ func (d Domain) Has(cmd string) bool {
 }
 
 // Media holds the default media-fetch budgets for bounded content into the
-// consumer context (REBUILD-nerv-core.md §2.2; the numbers inherit the
-// legacy renderer defaults, SPECS.md §4.2).
+// consumer context (the numbers are the studio defaults, SPECS §3.3).
 type Media struct {
 	MaxBlockBytes int    `json:"max_block_bytes"` // per media block budget
 	MaxDim        int    `json:"max_dim"`         // image longest side, px
@@ -78,16 +77,16 @@ type Config struct {
 	Debug          bool   // operator debug mode; wave logs are written only with it on
 	AIURL          string // OpenAI-compatible provider URL (LLM transport)
 	LLMOffload     bool   // XOR VRAM: offload LLM before GPU waves (blocking SSE)
-	GPUBackend     string // pool selector "cuda,rocm:0-1"; "" => greedy scoop of all detected (§2.5)
-	ExternalGPU    string // remote slots "cuda@host1:2,rocm@host2" (§2.5)
+	GPUBackend     string // pool selector "cuda,rocm:0-1"; "" => greedy scoop of all detected (SPECS §6.7)
+	ExternalGPU    string // remote slots "cuda@host1:2,rocm@host2" (SPECS §6.7)
 	Port           int
 	MaxOutputChars int
-	Env            map[string]string // user env mixed into every tool launch (§2.4)
-	Domains        map[string]Domain // mounted directories: path + allow-list + hint (§3.7)
+	Env            map[string]string // user env mixed into every tool launch (SPECS §2.2)
+	Domains        map[string]Domain // mounted directories: path + allow-list + hint (SPECS §3.7)
 	Media          Media
 
 	// Warnings collects startup warnings for stderr (the daemon keeps no
-	// logs without --debug, §2.7). Not part of the configuration itself.
+	// logs without --debug, SPECS §6.6). Not part of the configuration itself.
 	Warnings []string
 }
 

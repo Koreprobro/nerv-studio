@@ -30,8 +30,8 @@ import (
 
 // callDomain runs one domain command over the shared browse mechanism.
 // The config allow-list gates the command; fullRawAccess opens everything
-// that the mechanism knows (§2.2). On an "execute"-granted domain the
-// probe command (and a bare call) speaks the tool-info dialect (§3.7).
+// that the mechanism knows (SPECS §3.3). On an "execute"-granted domain the
+// probe command (and a bare call) speaks the tool-info dialect (SPECS §3.7).
 func (s *Server) callDomain(name string, args map[string]any) ToolResult {
 	raw := optBool(args, "fullRawAccess")
 	d := s.domains[name]
@@ -43,6 +43,9 @@ func (s *Server) callDomain(name string, args map[string]any) ToolResult {
 		} else {
 			cmd = "browse"
 		}
+	}
+	if cmd == "help" {
+		return s.domainHelp(name, asString(args, "path")) // always available (§3.3)
 	}
 	if !raw && !hasAny(s.Cfg.Domains[name].Commands, cmd) {
 		return toolError("command %q is not enabled for %s; available: %s",
@@ -102,8 +105,8 @@ func (s *Server) callDomain(name string, args map[string]any) ToolResult {
 			return toolError("%v", err)
 		}
 		out := "wrote " + rel
-		if name == s.Mount {
-			out += " (artifactURL: " + artifactURL(rel) + ")"
+		if s.nestable(name) {
+			out += " (artifactURL: " + nestURL(name, rel) + ")"
 		}
 		return textResult(out)
 	}
@@ -124,8 +127,8 @@ func (s *Server) fetchMedia(name string, d *browse.Domain, path string, args map
 	}
 	res := ToolResult{Content: []ToolContent{block(base64.StdEncoding.EncodeToString(med.Data), med.Mime)}}
 	note := ""
-	if name == s.Mount {
-		note = "artifactURL: " + artifactURL(path)
+	if s.nestable(name) {
+		note = "artifactURL: " + nestURL(name, path)
 	}
 	if med.Degraded {
 		if note != "" {

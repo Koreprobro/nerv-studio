@@ -81,6 +81,7 @@ func fixtureTweak(t *testing.T, tweak func(*config.Config), pool *gpu.Pool) (*ht
 		"tools": scheduler.New(scheduler.Deps{
 			ToolsDir:    dirs["tools"],
 			Artifactory: store.Store{Root: dirs["artifactory"]},
+			MountName:   "artifactory",
 			Pool:        pool,
 		}),
 	})
@@ -120,7 +121,9 @@ func writeTool(t *testing.T, toolsDir, name, info, body string) {
 	}
 }
 
-// rpc POSTs one request and decodes the JSON response.
+// rpc POSTs one request and decodes the JSON response. A blocking execute
+// answers over SSE (SPECS §6.6): the JSON-RPC response is then the payload
+// of the stream's last data: event — comments and notifications fall away.
 func rpc(t *testing.T, ts *httptest.Server, id string, method string, params map[string]any) map[string]any {
 	t.Helper()
 	body := map[string]any{"jsonrpc": "2.0", "method": method}
@@ -137,11 +140,27 @@ func rpc(t *testing.T, ts *httptest.Server, id string, method string, params map
 	}
 	defer resp.Body.Close()
 	all, _ := io.ReadAll(resp.Body)
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		all = sseLastData(string(all))
+	}
 	var out map[string]any
 	if err := json.Unmarshal(all, &out); err != nil {
 		t.Fatalf("response not JSON (%s): %q", resp.Header.Get("Content-Type"), string(all)[:min(200, len(all))])
 	}
 	return out
+}
+
+// sseLastData returns the payload of the last "data:" line of an SSE body
+// (the JSON-RPC response; keepalive comments and progress notifications of
+// a request without a token fall away).
+func sseLastData(txt string) []byte {
+	var last []byte
+	for _, line := range strings.Split(txt, "\n") {
+		if s, ok := strings.CutPrefix(line, "data: "); ok {
+			last = []byte(s)
+		}
+	}
+	return last
 }
 
 func call(t *testing.T, ts *httptest.Server, tool string, args map[string]any) (ToolResult, map[string]any) {
@@ -282,5 +301,148 @@ func TestAllowListAndRawAccess(t *testing.T) {
 	res, _ = call(t, ts, "kb", map[string]any{"command": "browse", "fullRawAccess": true})
 	if res.IsError {
 		t.Errorf("fullRawAccess browse failed: %s", firstText(res))
+	}
+}
+
+// TestRedactionBoundary guards SPECS §3.6 at the response boundary:
+// absolute roots must never reach the client — neither inside error
+// texts (the OWU-chat evidence: "open /home/.../kb/protocol-nsfw") nor
+// inside file content read back verbatim.
+func TestRedactionBoundary(t *testing.T) {
+	ts, art := fixture(t)
+
+	// Error text: a missing kb document names its root by tag.
+	res, _ := call(t, ts, "kb", map[string]any{"command": "read", "path": "protocol-nsfw"})
+	if !res.IsError {
+		t.Fatalf("kb read of a missing path must error: %+v", res)
+	}
+	if txt := firstText(res); !strings.Contains(txt, "<kb>/protocol-nsfw") || strings.Contains(txt, "/kb/") {
+		t.Fatalf("kb error must redact the root to its tag: %q", txt)
+	}
+
+	// Error text on the playground root: tag, not the absolute dir.
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "browse", "path": "no-such-dir"})
+	if txt := firstText(res); !strings.Contains(txt, "<artifactory>/") || strings.Contains(txt, art) {
+		t.Fatalf("artifactory browse error must redact the root: %q", txt)
+	}
+
+	// File content: a document quoting an absolute path is mapped on read.
+	if err := os.WriteFile(filepath.Join(art, "quote.txt"),
+		[]byte("seen at "+art+"/x.png\\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "read", "path": "quote.txt"})
+	if res.IsError {
+		t.Fatalf("read failed: %s", firstText(res))
+	}
+	if txt := firstText(res); strings.Contains(txt, art) || !strings.Contains(txt, "<artifactory>/x.png") {
+		t.Fatalf("read content must be redacted at the boundary: %q", txt)
+	}
+
+	// Jail rule (SPECS §3.6): paths outside every mounted root vanish too
+	// — full server paths survive only in debug artifacts. Tagged tails,
+	// URLs and /nest/ links must come back untouched.
+	body := "see /var/log/server.log and " + os.TempDir() + "/w.log and " +
+		"http://127.0.0.1:9696/nest/artifactory/img.png plus /nest/artifactory/img.png plus /deep/dir/"
+	if err := os.WriteFile(filepath.Join(art, "jail.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "read", "path": "jail.txt"})
+	txt := firstText(res)
+	for _, want := range []string{"<path>/server.log", "<tmp>/w.log",
+		"http://127.0.0.1:9696/nest/artifactory/img.png", "/nest/artifactory/img.png", "<path>/dir/"} {
+		if !strings.Contains(txt, want) {
+			t.Fatalf("jail scrub must keep %q, got %q", want, txt)
+		}
+	}
+	for _, leak := range []string{"/var/log", "/deep", os.TempDir() + "/w.log"} {
+		if strings.Contains(txt, leak) {
+			t.Fatalf("jail scrub leaked %q in %q", leak, txt)
+		}
+	}
+}
+
+// TestReadFetchGates guards the two doors (SPECS §3.3): read is the text
+// door and fetch the media door — each refuses the other's content with a
+// pointer instead of ingesting mojibake or paying block format for prose.
+func TestReadFetchGates(t *testing.T) {
+	ts, art := fixture(t)
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00, 0x0d}
+	if err := os.WriteFile(filepath.Join(art, "shot.png"), png, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := call(t, ts, "artifactory", map[string]any{"command": "read", "path": "shot.png"})
+	if txt := firstText(res); !res.IsError || !strings.Contains(txt, "use fetch") {
+		t.Fatalf("read of a binary must point at fetch: %+v %q", res, txt)
+	}
+	if err := os.WriteFile(filepath.Join(art, "note.md"), []byte("# note\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "fetch", "path": "note.md"})
+	if txt := firstText(res); !res.IsError || !strings.Contains(txt, "use read") {
+		t.Fatalf("fetch of text must point at read: %+v %q", res, txt)
+	}
+	// The right-hand side of each door still works.
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "read", "path": "note.md"})
+	if res.IsError || !strings.Contains(firstText(res), "# note") {
+		t.Fatalf("read of text must pass: %+v %q", res, firstText(res))
+	}
+}
+
+func TestDomainHelp(t *testing.T) {
+	ts, _ := fixture(t)
+	// help is always available, even ungranted, and lists only what works.
+	res, _ := call(t, ts, "kb", map[string]any{"command": "help"})
+	txt := firstText(res)
+	if res.IsError || !strings.Contains(txt, "  read —") || !strings.Contains(txt, "  probe —") {
+		t.Fatalf("kb help: %+v %q", res, txt)
+	}
+	if strings.Contains(txt, "write") || strings.Contains(txt, "execute") {
+		t.Errorf("kb help lists ungranted commands: %q", txt)
+	}
+	// The toolbox listing carries the wave pair and no plain-directory noise.
+	res, _ = call(t, ts, "tools", map[string]any{"command": "help"})
+	txt = firstText(res)
+	if res.IsError || !strings.Contains(txt, "  execute —") || !strings.Contains(txt, "  check —") {
+		t.Fatalf("toolbox help must list the wave pair: %+v %q", res, txt)
+	}
+	// On a toolbox, probe help speaks the tool-info dialect.
+	res, _ = call(t, ts, "tools", map[string]any{"command": "help", "path": "probe"})
+	if res.IsError || !strings.Contains(firstText(res), "tool's card") {
+		t.Errorf("toolbox probe help: %+v %q", res, firstText(res))
+	}
+	// Full method info names the parameters the daemon actually reads.
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "help", "path": "fetch"})
+	txt = firstText(res)
+	if res.IsError || !strings.Contains(txt, "max_block_bytes") || !strings.Contains(txt, "seek") {
+		t.Errorf("fetch help: %+v %q", res, txt)
+	}
+	// Unknown method: an error that lists what is available.
+	res, _ = call(t, ts, "artifactory", map[string]any{"command": "help", "path": "nope"})
+	txt = firstText(res)
+	if !res.IsError || !strings.Contains(txt, "available:") || !strings.Contains(txt, "fetch") {
+		t.Errorf("unknown method: %+v %q", res, txt)
+	}
+	// tools/list advertises help in the command enum.
+	out := rpc(t, ts, `2`, "tools/list", nil)
+	resMap, _ := out["result"].(map[string]any)
+	b, _ := json.Marshal(resMap["tools"])
+	var tools []toolDef
+	if err := json.Unmarshal(b, &tools); err != nil {
+		t.Fatal(err)
+	}
+	for _, td := range tools {
+		if td.Name != "artifactory" {
+			continue
+		}
+		props, _ := td.InputSchema["properties"].(map[string]any)
+		cmdProp, _ := props["command"].(map[string]any)
+		arr, _ := cmdProp["enum"].([]any)
+		for _, v := range arr {
+			if v == "help" {
+				return
+			}
+		}
+		t.Errorf("artifactory command enum lacks help: %v", arr)
 	}
 }

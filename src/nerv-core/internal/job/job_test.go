@@ -99,11 +99,11 @@ func TestCheckResolvesIO(t *testing.T) {
 	ti := parse(t, genInfo)
 	j := &Job{Tool: "t.sh", Params: map[string]any{
 		"prompt": "hi",
-		"output": "artifacts/scene/shot.png",
-		"refs":   []any{"a.png", "artifacts/b.png", ""},
+		"output": "nest/out/scene/shot.png",
+		"refs":   []any{"a.png", "nest/out/b.png", ""},
 		"cfg":    "operator value", // hidden param passes validation
 	}}
-	outs, ins, reason := j.Check(ti)
+	outs, ins, reason := j.Check(ti, "out")
 	if reason != "" {
 		t.Fatalf("reason: %q", reason)
 	}
@@ -144,13 +144,13 @@ func TestCheckSkipReasons(t *testing.T) {
 	}
 	for _, c := range cases {
 		j := &Job{Tool: "t.sh", Params: c.params}
-		_, _, reason := j.Check(ti)
+		_, _, reason := j.Check(ti, "out")
 		if reason == "" || !strings.Contains(reason, c.want) {
 			t.Errorf("%s: want reason containing %q, got %q", c.name, c.want, reason)
 		}
 	}
 	// Optional input absent is fine.
-	if _, _, reason := (&Job{Tool: "t.sh", Params: map[string]any{"prompt": "x", "output": "o.png"}}).Check(ti); reason != "" {
+	if _, _, reason := (&Job{Tool: "t.sh", Params: map[string]any{"prompt": "x", "output": "o.png"}}).Check(ti, "out"); reason != "" {
 		t.Errorf("absent optional input: %q", reason)
 	}
 }
@@ -170,19 +170,20 @@ func TestPerJobOverrides(t *testing.T) {
 }
 
 func TestPaths(t *testing.T) {
-	for _, c := range []struct{ in, want string }{
-		{"artifacts/a/b.png", "a/b.png"},
-		{"a/b.png", "a/b.png"},
-		{"artifacts/artifacts/x", "artifacts/x"}, // one-way fold only
-		{"dir//x.png", "dir/x.png"},
-		{" ./x ", "x"},
+	for _, c := range []struct{ in, mount, want string }{
+		{"nest/out/a/b.png", "out", "a/b.png"},
+		{"a/b.png", "out", "a/b.png"},
+		{"nest/out/nest/out/x", "out", "nest/out/x"},  // one-way fold only
+		{"nest/kb/a/b.png", "out", "nest/kb/a/b.png"}, // a foreign-domain URL never folds
+		{"dir//x.png", "out", "dir/x.png"},
+		{" ./x ", "out", "x"},
 	} {
-		if got := NormalizePath(c.in); got != c.want {
-			t.Errorf("NormalizePath(%q) = %q, want %q", c.in, got, c.want)
+		if got := NormalizePath(c.in, c.mount); got != c.want {
+			t.Errorf("NormalizePath(%q, %q) = %q, want %q", c.in, c.mount, got, c.want)
 		}
 	}
 	for _, bad := range []string{"", "/abs/x", "../up", "a/../../up"} {
-		if err := WithinRel(NormalizePath(bad)); err == nil {
+		if err := WithinRel(NormalizePath(bad, "out")); err == nil {
 			t.Errorf("WithinRel(%q) must reject", bad)
 		}
 	}

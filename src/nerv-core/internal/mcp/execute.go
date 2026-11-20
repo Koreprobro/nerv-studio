@@ -25,11 +25,19 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
+	"strings"
 	"sync"
+	"time"
 
 	"nerv-core/internal/job"
 	"nerv-core/internal/scheduler"
 )
+
+// sseKeepalive caps the silence of a blocking SSE wave stream: long
+// single-job phases emit no status flips, so a ": keepalive" comment line
+// goes out on this interval to keep proxies from reaping the connection.
+const sseKeepalive = 30 * time.Second
 
 // executeAnswer is the wave reply: scheduler result + artifactURLs + the
 // wave identity on top.
@@ -50,15 +58,19 @@ type answeredJob struct {
 	Slots       []string `json:"slots,omitempty"`
 }
 
-// callExecute is the wave launch point and the wave ledger lookup (§2.3),
-// reached through an "execute"-granted domain ({command:"execute"}, §3.7).
-// Launch input is the path to a queue file in the playground — a bare JSON
-// array of {tool, params} lines the daemon reads but never mutates. Mode
-// follows the config: with llm_offload on, a queue with any gpu-require > 0
-// line runs blocking (SSE progress when the client carries a progressToken,
-// plain JSON otherwise); everything else runs async — the wave belongs to
-// the daemon and the answer returns immediately with the wave id.
-// {"wave": "latest"|<id>} looks a wave up in the ledger.
+// callExecute is the wave launch point and the wave ledger lookup (SPECS §6.1),
+// reached through an "execute"-granted domain ({command:"execute"}, SPECS §3.7).
+// Launch input is a queue file — or a comma-separated set of queue files
+// merged into one wave — in the playground: each a JSON array of {tool,
+// params} lines or the {"defaults"?, "jobs", "wave"?} envelope (SPECS §6.1);
+// the finished wave is stamped back into its files as a "wave" block, so a
+// queue file is a self-describing ticket. Mode follows the config: with
+// llm_offload on, a queue with any gpu-require > 0 line runs blocking (one
+// SSE stream for the wave's life; notifications/progress ride it when the
+// client carries a progressToken). Everything
+// else runs async — the answer returns immediately with the wave
+// id. Either way the wave belongs to the daemon: a gone client never kills
+// it (SPECS §6.6). {"wave": "latest"|<id>} looks a wave up in the ledger.
 func (s *Server) callExecute(toolbox string, w http.ResponseWriter, r *http.Request, req rpcRequest, args, meta map[string]any) (ToolResult, bool) {
 	if id := asString(args, "wave"); id != "" {
 		wv := s.findWave(id, optBool(args, "fullRawAccess"))
@@ -72,19 +84,9 @@ func (s *Server) callExecute(toolbox string, w http.ResponseWriter, r *http.Requ
 	if sched == nil {
 		return toolError("%s has no scheduler (not an execute-granted domain)", toolbox), false
 	}
-	raw, path, err := s.readQueueFile(args)
+	queue, files, err := s.readQueueSet(args)
 	if err != nil {
 		return toolError("%v", err), false
-	}
-	if first := firstByte(raw); first != "" && first != "[" {
-		return toolError(`queue file %s: want a bare JSON array [{"tool": ...}] — the {"queue": ...} envelope is dead (REBUILD §4.9)`, path), false
-	}
-	var queue []job.Job
-	if err := json.Unmarshal(raw, &queue); err != nil {
-		return toolError("queue file %s: %v", path, err), false
-	}
-	if len(queue) == 0 {
-		return toolError("queue file %s is empty", path), false
 	}
 
 	adm, skipped := sched.Admit(queue)
@@ -103,86 +105,186 @@ func (s *Server) callExecute(toolbox string, w http.ResponseWriter, r *http.Requ
 	}
 	tag := ""
 	if optBool(args, "fullRawAccess") {
-		tag = "raw" // raw launches stay out of the consumer default-latest (§2.2)
+		tag = "raw" // raw launches stay out of the consumer default-latest (SPECS §3.3)
 	}
 
-	// The wave ctx: async waves belong to the daemon (server ctx only),
-	// blocking ones also die with their connection (§2.3).
-	var (
-		wctx   context.Context
-		cancel context.CancelFunc
-	)
-	if blocking {
-		wctx, cancel = joinCtx(r.Context(), s.waveCtx)
-	} else {
-		wctx, cancel = context.WithCancel(s.waveCtx)
+	// The wave ctx: every wave belongs to the daemon (SPECS §6.6) — a gone
+	// connection never kills a running wave. Cancellation is explicit:
+	// daemon shutdown or POST /wave/stop.
+	wctx, cancel := context.WithCancel(s.waveCtx)
+	wv := s.newWave(mode, tag, toolbox, files, adm, skipped, wctx, cancel)
+
+	// Blocking wave: the answer rides one SSE stream (SPECS §6.6). Headers
+	// and a ": wave" comment flush before the submit, so a client or proxy
+	// never sits on a byteless POST — a silent minutes-long wait is exactly
+	// what read timeouts reap mid-render. A progressToken additionally gets
+	// notifications/progress on the stream; the final response always
+	// closes it. Plain JSON remains the fallback for a transport that
+	// cannot flush. The progress hook attaches before the submit: the
+	// runner may flip the first job to running before this handler is back.
+	token, hasToken := meta["progressToken"]
+	flusher, canStream := w.(http.Flusher)
+	stream := blocking && canStream
+	var writeMu sync.Mutex
+	send := func(payload any) {
+		note, _ := json.Marshal(payload)
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		fmt.Fprintf(w, "event: message\ndata: %s\n\n", note)
+		flusher.Flush()
 	}
-	wv := s.newWave(mode, tag, toolbox, path, adm, skipped, wctx, cancel)
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		writeMu.Lock()
+		fmt.Fprintf(w, ": wave %s\n\n", wv.ID)
+		flusher.Flush()
+		writeMu.Unlock()
+		if hasToken {
+			wv.setProgress(func(j *job.Job, st job.Status) {
+				params := wv.progressParams(token, j, st)
+				if line, ok := params["message"].(string); ok {
+					line = s.redact(line) // a failed job quotes tool stderr: no raw roots (SPECS §3.6)
+					params["message"], params["markdown"] = line, line
+				}
+				send(map[string]any{"jsonrpc": "2.0", "method": "notifications/progress",
+					"params": params})
+			})
+		}
+	}
 	if err := s.submitWave(wv); err != nil {
 		cancel()
+		if stream { // headers are already out: answer the launch error on the stream
+			send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: s.guardVolume(s.redactResult(toolError("%v", err)), args)})
+			return ToolResult{}, true
+		}
 		return toolError("%v", err), false
 	}
 	if !blocking {
 		return jsonResult(wv.view(s.Cfg.Debug)), false
 	}
-
-	// Blocking wave: SSE when the client carries a progressToken (hours of
-	// generation on one open stream), plain JSON otherwise. The wave runs
-	// on the pipeline goroutine; this handler only waits and writes.
-	token, hasToken := meta["progressToken"]
-	flusher, canStream := w.(http.Flusher)
-	if hasToken && canStream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-		var writeMu sync.Mutex
-		wv.setProgress(func(j *job.Job, st job.Status) {
-			note, _ := json.Marshal(map[string]any{
-				"jsonrpc": "2.0", "method": "notifications/progress",
-				"params": map[string]any{"progressToken": token,
-					"message": fmt.Sprintf("%s %s", j.Tool, st)},
-			})
-			writeMu.Lock()
-			defer writeMu.Unlock()
-			fmt.Fprintf(w, "event: message\ndata: %s\n\n", note)
-			flusher.Flush()
-		})
+	if !stream {
 		<-wv.done
-		final, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: req.ID,
-			Result: s.waveResult(wv)})
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		fmt.Fprintf(w, "event: message\ndata: %s\n\n", final)
-		flusher.Flush()
-		return ToolResult{}, true // response already streamed
+		return s.waveResult(wv), false
 	}
+	// Keepalive: long single-job phases keep the stream silent — an SSE
+	// comment every sseKeepalive keeps proxies and client read timeouts off
+	// a live wave's stream, token or no token.
+	kaDone := make(chan struct{})
+	defer close(kaDone)
+	go func() {
+		tick := time.NewTicker(sseKeepalive)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				writeMu.Lock()
+				fmt.Fprint(w, ": keepalive\n\n")
+				flusher.Flush()
+				writeMu.Unlock()
+			case <-kaDone:
+				return
+			}
+		}
+	}()
 	<-wv.done
-	return s.waveResult(wv), false
+	// The wave outlives this connection by design: writes to a dead
+	// client simply fail, the wave stands and its result is stamped
+	// into the queue files (SPECS §6.1, §6.6).
+	res := s.guardVolume(s.redactResult(s.waveResult(wv)), args)
+	if strings.Contains(resText(res), "[volume guard") {
+		// The cap tripped on a finished wave: re-sending the execute would
+		// reshoot it, so point the full dump at the ledger lookup instead.
+		res.Content[0].Text += " [the wave is over: execute wave=\"" + wv.ID +
+			"\" re-answers it; volume_ack=true lifts the cap]"
+	}
+	send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res})
+	return ToolResult{}, true // response already streamed
 }
 
-// readQueueFile resolves and reads the queue file: the `queue` argument
-// names a JSON file under the playground (mount) root.
-func (s *Server) readQueueFile(args map[string]any) (raw []byte, rel string, err error) {
+// queueFile reports one parsed member of a queue set (the check answer,
+// SPECS §6.1).
+type queueFile struct {
+	File string `json:"file"`
+	Jobs int    `json:"jobs"`
+}
+
+// checkAnswer is the dry-run report of {command: "check"}: what the queue
+// set holds and what admission would make of it — nothing launched.
+type checkAnswer struct {
+	Files    []queueFile         `json:"files"`
+	Jobs     int                 `json:"jobs"`
+	Admitted int                 `json:"admitted"`
+	Skipped  []scheduler.Skipped `json:"skipped,omitempty"`
+}
+
+// callCheck is the dry run of the queue paradigm (SPECS §6.1): the same
+// reader and the same admission as execute, but nothing launches — no wave,
+// no ledger entry, nothing moved on disk. Parse failures answer isError and
+// name the file; otherwise the report counts jobs per file and lists the
+// lines admission would skip (unknown tool, missing output, unfit GPU ask).
+func (s *Server) callCheck(toolbox string, args map[string]any) ToolResult {
+	queue, files, err := s.readQueueSet(args)
+	if err != nil {
+		return toolError("%v", err)
+	}
+	sched := s.Scheds[toolbox]
+	if sched == nil {
+		return toolError("%s has no scheduler (not an execute-granted domain)", toolbox)
+	}
+	adm, skipped := sched.Admit(queue)
+	rep := checkAnswer{Files: files, Jobs: len(queue), Admitted: len(adm), Skipped: skipped}
+	res := jsonResult(rep)
+	if len(adm) == 0 {
+		res.IsError = true // execute would refuse this launch
+	}
+	return res
+}
+
+// readQueueSet resolves and reads the launch input: the `queue` argument
+// names one queue file under the playground (mount) root — or a
+// comma-separated set of them, merged in list order into one wave
+// (SPECS §6.1). Any file that fails to resolve, parse or hold jobs
+// rejects the whole launch before the wave starts; the wave and its debug
+// fold anchor at the first file.
+func (s *Server) readQueueSet(args map[string]any) (queue []job.Job, files []queueFile, err error) {
 	p := asString(args, "queue")
 	if p == "" {
 		p = asString(args, "path")
 	}
 	if p == "" {
 		if _, isArray := args["queue"].([]any); isArray {
-			return nil, "", fmt.Errorf(`execute wants a queue FILE path (REBUILD §2.3): {"queue": "<project>/queue.json"} — the inline job array is retired`)
+			return nil, nil, fmt.Errorf(`execute wants a queue FILE path (SPECS §6.1): {"queue": "<project>/queue.json"} — the inline job array is retired`)
 		}
-		return nil, "", fmt.Errorf(`execute needs {"queue": "<path>"} (queue file in the playground) or {"wave": "latest"|<id>}`)
+		return nil, nil, fmt.Errorf(`execute needs {"queue": "<path>[, <path>...]"} (queue files in the playground) or {"wave": "latest"|<id>}`)
 	}
-	rel = job.NormalizePath(p)
-	if err := job.WithinRel(rel); err != nil {
-		return nil, "", fmt.Errorf("queue file: %v", err)
+	for _, part := range strings.Split(p, ",") {
+		if part = strings.TrimSpace(part); part == "" {
+			continue
+		}
+		rel := job.NormalizePath(part, s.Mount)
+		if err := job.WithinRel(rel); err != nil {
+			return nil, nil, fmt.Errorf("queue file %s: %v", part, err)
+		}
+		raw, err := os.ReadFile(s.Store.Abs(rel))
+		if err != nil {
+			return nil, nil, fmt.Errorf("queue file %s: %s", rel, s.redact(err.Error()))
+		}
+		qs, err := parseQueueFile(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("queue file %s: %v", rel, err)
+		}
+		if len(qs) == 0 {
+			return nil, nil, fmt.Errorf("queue file %s is empty", rel)
+		}
+		files = append(files, queueFile{File: rel, Jobs: len(qs)})
+		queue = append(queue, qs...)
 	}
-	raw, err = os.ReadFile(s.Store.Abs(rel))
-	if err != nil {
-		return nil, "", fmt.Errorf("queue file: %s", s.redact(err.Error()))
+	if len(files) == 0 {
+		return nil, nil, fmt.Errorf(`execute needs a non-empty {"queue": "<path>[, <path>...]"}`)
 	}
-	return raw, rel, nil
+	return queue, files, nil
 }
 
 // waveResult builds the blocking answer: the final ledger view, isError
@@ -191,6 +293,48 @@ func (s *Server) waveResult(wv *wave) ToolResult {
 	res := wv.result()
 	return ToolResult{Content: []ToolContent{textBlock(prettyJSON(wv.view(s.Cfg.Debug)))},
 		IsError: !res.OK()}
+}
+
+// parseQueueFile reads one queue file (SPECS §6.1): a bare JSON array of
+// {tool, params} lines, or the envelope {"defaults": {...}, "jobs": [...],
+// "wave": {...}}. Defaults merge into every line via job.MergeDefaults; the
+// daemon-written "wave" block is ignored on read — resubmitting a finished
+// queue reshoots the same recipe.
+func parseQueueFile(raw []byte) ([]job.Job, error) {
+	if firstByte(raw) == "[" {
+		var qs []job.Job
+		if err := json.Unmarshal(raw, &qs); err != nil {
+			return nil, err
+		}
+		return qs, nil
+	}
+	var env struct {
+		Defaults *job.Job  `json:"defaults"`
+		Jobs     []job.Job `json:"jobs"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf(`want a JSON array or the {"defaults"?, "jobs", "wave"?} envelope (SPECS §6.1): %v`, err)
+	}
+	if len(env.Jobs) == 0 {
+		return nil, fmt.Errorf(`envelope needs a non-empty "jobs" array`)
+	}
+	if d := env.Defaults; d != nil {
+		for i := range env.Jobs {
+			env.Jobs[i].MergeDefaults(*d)
+		}
+	}
+	return env.Jobs, nil
+}
+
+// jobDisplay names a job for the human progress lines: the stem of its
+// output file (what the client named and will look for), the tool as the
+// fallback for tools without an output param.
+func jobDisplay(j *job.Job) string {
+	if s, ok := j.Params["output"].(string); ok && s != "" {
+		b := path.Base(s)
+		return strings.TrimSuffix(b, path.Ext(b))
+	}
+	return j.Tool
 }
 
 // firstByte reports the first non-space byte of the queue file as a string
@@ -206,13 +350,15 @@ func firstByte(raw []byte) string {
 	return ""
 }
 
-func mapAnswer(res scheduler.Result) executeAnswer {
+// mapAnswer builds the wave ledger view of a result: artifactURLs of the
+// active playground ride on top of the scheduler's lines (SPECS §3.1).
+func (w *wave) mapAnswer(res scheduler.Result) executeAnswer {
 	out := executeAnswer{}
 	for _, j := range res.Jobs {
 		a := answeredJob{Index: j.Index, Tool: j.Tool, Outputs: j.Outputs, Archived: j.Archived,
 			Status: j.Status, Error: j.Error, Dur: j.Dur, Slots: j.Slots}
 		for _, o := range j.Outputs {
-			a.ArtifactURL = append(a.ArtifactURL, artifactURL(o))
+			a.ArtifactURL = append(a.ArtifactURL, nestURL(w.Mount, o))
 		}
 		out.Jobs = append(out.Jobs, a)
 	}

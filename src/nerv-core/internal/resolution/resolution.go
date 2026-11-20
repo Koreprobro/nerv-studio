@@ -31,8 +31,10 @@ import (
 )
 
 // Spec bounds the search. Multiple is the side granularity (model/VAE
-// divisor); Target is the preferred pixel count; the area is bounded
-// MinSide^2..MaxSide^2, and a final side below MinSide is an error.
+// divisor); Target is the preferred pixel count; the area floor is MinSide^2
+// and a final side below it is an error. MaxSide is an optional area ceiling
+// (MaxSide^2), 0 meaning unbounded: the consumer asks for a canvas, and the
+// generator's own limits are the tool's business, not the calculator's.
 type Spec struct {
 	Multiple int
 	Target   int
@@ -40,9 +42,9 @@ type Spec struct {
 	MaxSide  int
 }
 
-// Studio is the default spec: sides multiple of 32, ~2 MP target, area
-// bounded 512^2..1536^2 (the sd-family envelope).
-func Studio() Spec { return Spec{Multiple: 32, Target: 2_000_000, MinSide: 512, MaxSide: 1536} }
+// Studio is the default spec: sides multiple of 32, ~2 MP target, 512 px side
+// floor, no ceiling.
+func Studio() Spec { return Spec{Multiple: 32, Target: 2_000_000, MinSide: 512} }
 
 func (s Spec) normalized() Spec {
 	d := Studio()
@@ -55,8 +57,8 @@ func (s Spec) normalized() Spec {
 	if s.MinSide <= 0 {
 		s.MinSide = d.MinSide
 	}
-	if s.MaxSide < s.MinSide {
-		s.MaxSide = d.MaxSide
+	if s.MaxSide > 0 && s.MaxSide < s.MinSide {
+		s.MaxSide = s.MinSide // a ceiling under the floor is the floor
 	}
 	return s
 }
@@ -94,9 +96,10 @@ func Ratio(aspect string) (float64, error) {
 
 // Compute returns generator-friendly WxH for the aspect under spec: the ratio
 // scaled to the pixel target with both sides rounded to the nearest multiple,
-// the area pulled back inside MinSide^2..MaxSide^2 when it overshoots. A
-// result with a side below MinSide is reported as an error but the pair is
-// still returned (the caller may know better than the floor).
+// the area pulled back inside the bounds when it overshoots — the ceiling only
+// when the spec sets one. A result with a side below MinSide is reported as an
+// error but the pair is still returned (the caller may know better than the
+// floor).
 func Compute(aspect string, spec Spec) (int, int, error) {
 	r, err := Ratio(aspect)
 	if err != nil {
@@ -116,10 +119,11 @@ func Compute(aspect string, spec Spec) (int, int, error) {
 		return round(float64(h) * r), h
 	}
 	minA := float64(spec.MinSide) * float64(spec.MinSide)
-	maxA := float64(spec.MaxSide) * float64(spec.MaxSide)
 	w, h := side(float64(spec.Target))
-	if float64(w)*float64(h) > maxA {
-		w, h = side(maxA)
+	if spec.MaxSide > 0 {
+		if maxA := float64(spec.MaxSide) * float64(spec.MaxSide); float64(w)*float64(h) > maxA {
+			w, h = side(maxA)
+		}
 	}
 	if float64(w)*float64(h) < minA {
 		w, h = side(minA)

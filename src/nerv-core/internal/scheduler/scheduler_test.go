@@ -80,6 +80,7 @@ func newFix(t *testing.T, pool *gpu.Pool) *fix {
 	s := New(Deps{
 		ToolsDir:    tools,
 		Artifactory: store.Store{Root: art},
+		MountName:   "art",
 		Pool:        pool,
 		UserEnv:     map[string]string{"OPVAR": "op-value"},
 	})
@@ -127,7 +128,7 @@ func TestFileExistenceDataflow(t *testing.T) {
 	f.tool(t, "echo.sh", outInfo, `printf 'hi' > "$NERV_OUTPUT"`)
 	f.tool(t, "join.sh", pipeInfo, `cat "$NERV_A" "$NERV_B" > "$NERV_OUTPUT"`)
 	r := run(t, f, []job.Job{
-		{Tool: "echo", Params: map[string]any{"text": "1", "output": "artifacts/a.txt"}},
+		{Tool: "echo", Params: map[string]any{"text": "1", "output": "nest/art/a.txt"}}, // copied URL folds
 		{Tool: "echo.sh", Params: map[string]any{"text": "2", "output": "b.txt"}},
 		{Tool: "join.sh", Params: map[string]any{"a": "a.txt", "b": "b.txt", "output": "c.txt"}},
 	})
@@ -239,7 +240,8 @@ func TestSkippedLines(t *testing.T) {
 }
 
 // TestEnvContract pins the slim scheduler↔sh contract (SPECS §5): both io
-// marks arrive absolute, the directory roots and the scheduler-consumed
+// marks arrive playground-relative and the job's cwd is the mount root
+// (the PWD line of the dump), the directory roots and the scheduler-consumed
 // gpu-* params are absent, physical slot ids flow unpinned into the backend
 // env (no re-indexing), user env passes through, arrays comma-join.
 func TestEnvContract(t *testing.T) {
@@ -264,7 +266,8 @@ func TestEnvContract(t *testing.T) {
 	}
 	env := string(data)
 	for _, want := range []string{
-		"NERV_OUTPUT=" + f.art.Root + "/env.txt", // io:"out" arrives absolute
+		"NERV_OUTPUT=env.txt", // io:"out" arrives playground-relative…
+		"PWD=" + f.art.Root,   // …and the job's cwd is the mount root
 		"PATH=/",
 		"OPVAR=op-value",
 		"CUDA_VISIBLE_DEVICES=1", // physical index, not a re-indexed 0
@@ -285,7 +288,7 @@ func TestEnvContract(t *testing.T) {
 	}
 }
 
-// TestCalculatorEnv pins §7.3: a tool declaring the aspect-ratio + target-mpx
+// TestCalculatorEnv pins SPECS §7.3: a tool declaring the aspect-ratio + target-mpx
 // pair gets the core-computed NERV_CALCULATED_WIDTH/HEIGHT; a tool declaring
 // only one of the pair gets neither; a broken aspect fails the job.
 func TestCalculatorEnv(t *testing.T) {
@@ -368,7 +371,7 @@ func TestCancelAbortsPending(t *testing.T) {
 }
 
 // The core archives an existing same-name output to name-<i>.ext before the
-// script starts (SPECS §6): the consumer gets exactly the declared name.
+// script starts (SPECS §6.5): the consumer gets exactly the declared name.
 func TestWaveArchivesOldOutput(t *testing.T) {
 	f := newFix(t, cudaPool(0))
 	f.tool(t, "echo.sh", outInfo, `printf '%s' "$NERV_TEXT" > "$NERV_OUTPUT"`)
@@ -428,9 +431,10 @@ func TestInPlaceOutputSkipsArchive(t *testing.T) {
 // Any declared name works (hyphenated ones surface as NERV_FILE_RESULT), and
 // a tool producing several artifacts declares several io:"out" fields — one
 // per file, single-valued. Every io value (in and out alike) arrives in the
-// script env as a FULL absolute path; outputs are additionally archived and
-// mkdir'd by the core beforehand.
-func TestOutFieldsEnvFullPathMultiOutput(t *testing.T) {
+// script env playground-relative, resolved by the job's cwd — the mount
+// root; outputs are additionally archived and mkdir'd by the core
+// beforehand.
+func TestIOFieldsEnvRelativeMultiOutput(t *testing.T) {
 	f := newFix(t, cudaPool(0))
 	f.tool(t, "multi.sh",
 		`{"summary":"hyphenated out field + second out field","fields":[
@@ -459,8 +463,8 @@ func TestOutFieldsEnvFullPathMultiOutput(t *testing.T) {
 		t.Errorf("archived: got %q", got)
 	}
 	b, _ := os.ReadFile(f.art.Abs("sub/r.txt"))
-	if want := f.art.Root + "/sub/r.txt|" + f.art.Root + "/in.txt"; string(b) != want {
-		t.Errorf("env must carry both io fields absolute: got %q want %q", b, want)
+	if want := "sub/r.txt|in.txt"; string(b) != want {
+		t.Errorf("env must carry both io fields playground-relative: got %q want %q", b, want)
 	}
 	if !f.art.Exists("t.txt") {
 		t.Error("second output t.txt missing")
@@ -470,9 +474,9 @@ func TestOutFieldsEnvFullPathMultiOutput(t *testing.T) {
 	}
 }
 
-// The debug wave log (§2.7): with RunOpts.LogPath the wave writes its
+// The debug wave log (SPECS §6.6): with RunOpts.LogPath the wave writes its
 // event lines plus prefixed job output into that one file; without it the
-// daemon writes no files at all (M12 default).
+// daemon writes no files at all (SPECS §6.6 default).
 func TestDebugWaveDump(t *testing.T) {
 	f := newFix(t, cudaPool(0))
 	f.tool(t, "chatty.sh",

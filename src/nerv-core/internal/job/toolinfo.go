@@ -19,7 +19,7 @@
 
 // Package job models a queue entry, the tool's self-declared interface
 // (--tool-info) and the validation rules binding the two together
-// (REBUILD-nerv-core.md §2.3, §2.4).
+// (SPECS §4, §6.2).
 package job
 
 import (
@@ -29,10 +29,10 @@ import (
 )
 
 // Reserved field names: scheduler-relevant ordinary fields declared by the
-// tool with a default (the ordinary-field convention, §2.4). Values in job
+// tool with a default (the ordinary-field convention, SPECS §4.4). Values in job
 // params override the defaults per job. The gpu trio is resolved by the
 // scheduler itself and never reaches the script env (SPECS §5.1); the
-// calculator pair triggers NERV_CALCULATED_WIDTH/HEIGHT injection (§7.3).
+// calculator pair triggers NERV_CALCULATED_WIDTH/HEIGHT injection (SPECS §7.3).
 const (
 	FieldGPURequire  = "gpu-require"
 	FieldGPUBackend  = "gpu-backend"
@@ -50,7 +50,7 @@ var SchedulerFields = map[string]bool{
 }
 
 // ReservedEnvNames are core-injected service env vars a declared field must
-// not shadow (SPECS §4.5). Under the slim contract (§5.1) the directory
+// not shadow (SPECS §4.5). Under the slim contract (SPECS §5.1) the directory
 // roots and the scheduler fields left the launch env — the calculator pair
 // is all that remains, and this check keeps the namespace clean.
 var ReservedEnvNames = map[string]bool{
@@ -70,7 +70,7 @@ func NormEnvField(field string) string {
 }
 
 // Field is one declared parameter of a tool. IO marks the dataflow role
-// (REBUILD §2.4): "in" — input file(s) the scheduler waits for; "out" —
+// (SPECS §4.2, §6.3): "in" — input file(s) the scheduler waits for; "out" —
 // output file(s) whose existence after exit 0 marks the job done. Hidden
 // entries are dropped from the consumer's probe view silently (entry absent
 // — no marker, no count) but their values pass through untouched.
@@ -83,7 +83,7 @@ type Field struct {
 	Hidden      bool   `json:"hidden,omitempty"`
 
 	// HasDefault reports an explicitly declared default (JSON null counts
-	// as absent). A hidden field must have one (§2.4).
+	// as absent). A hidden field must have one (SPECS §4.3).
 	HasDefault bool `json:"-"`
 }
 
@@ -165,7 +165,7 @@ func (ti *ToolInfo) Field(name string) (*Field, bool) {
 }
 
 // PublicFields returns the consumer-facing view: hidden entries dropped
-// silently — the consumer never learns anything was hidden (§2.4).
+// silently — the consumer never learns anything was hidden (SPECS §4.3).
 func (ti *ToolInfo) PublicFields() []Field {
 	out := make([]Field, 0, len(ti.Fields))
 	for _, f := range ti.Fields {
@@ -208,7 +208,7 @@ func (ti *ToolInfo) Require() int {
 }
 
 // Backend is the declared backend ("cuda"|"rocm"|"intel"|...) — "any" when
-// the tool does not declare one (§2.5).
+// the tool does not declare one (SPECS §6.7).
 func (ti *ToolInfo) Backend() string {
 	if s, ok := ti.defaultString(FieldGPUBackend); ok && s != "" {
 		return s
@@ -216,7 +216,7 @@ func (ti *ToolInfo) Backend() string {
 	return BackendAny
 }
 
-// Pin is the tool's declared slot pin selector ("" = no pin, §2.5).
+// Pin is the tool's declared slot pin selector ("" = no pin, SPECS §6.7).
 func (ti *ToolInfo) Pin() string {
 	s, _ := ti.defaultString(FieldGPUPin)
 	return s

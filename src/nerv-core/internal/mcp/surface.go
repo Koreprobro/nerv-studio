@@ -32,16 +32,14 @@ type toolDef struct {
 }
 
 // fallbackHints: built-in one-liners for the fixed utilities. Domain tool
-// descriptions arrive from the config "hint" field (§3.7).
+// descriptions arrive from the config "hint" field (SPECS §3.7).
 var fallbackHints = map[string]string{
 	"dice.roll":       "dice roller — notation + optional replayable seed",
 	"calc.resolution": "resolution calculator — aspect in, generator WxH out",
-	"gpu.list":        "gpu pool diagnostics (hidden tool)",
 }
 
 // toolsList is the config-driven surface (SPECS §3.7): every mounted
-// directory is a tool, sorted by name, then the utilities; gpu.list stays
-// hidden.
+// directory is a tool, sorted by name, then the utilities.
 func (s *Server) toolsList() []toolDef {
 	names := s.Cfg.DomainNames()
 	out := make([]toolDef, 0, len(names)+2)
@@ -64,7 +62,7 @@ func (s *Server) toolsList() []toolDef {
 				"multiple": map[string]any{"type": "integer", "description": "side granularity in px (default 32)"},
 				"targetMP": map[string]any{"type": "number", "description": "pixel target in megapixels (default 2)"},
 				"minSide":  map[string]any{"type": "integer", "description": "smallest usable side; bounds the area to minSide^2 (default 512)"},
-				"maxSide":  map[string]any{"type": "integer", "description": "largest area as maxSide^2 pixels (default 1536)"},
+				"maxSide":  map[string]any{"type": "integer", "description": "largest area as maxSide^2 pixels (default 0 = no ceiling)"},
 			},
 			"required": []string{"aspect"},
 		}})
@@ -76,7 +74,7 @@ func (s *Server) toolsList() []toolDef {
 func (s *Server) hint(name string) string {
 	if d, ok := s.Cfg.Domains[name]; ok {
 		if d.Hint != "" {
-			return d.Hint
+			return s.redact(d.Hint) // an operator hint is no place for a raw root either
 		}
 		return name + " — mounted directory: " + strings.Join(allowedVisible(d.Commands), ", ")
 	}
@@ -88,10 +86,12 @@ func (s *Server) hint(name string) string {
 // "execute"-granted domain additionally speaks the queue/wave pair.
 func (s *Server) domainSchema(name string) map[string]any {
 	d := s.Cfg.Domains[name]
+	toolbox := hasAny(d.Commands, "execute")
+	cmds := helpCommands(d) // visible grants + check (toolbox) + help (§3.3)
 	props := map[string]any{
-		"command": map[string]any{"type": "string", "enum": allowedVisible(d.Commands),
-			"description": "domain command (allow-list is config-driven)"},
-		"path":      map[string]any{"type": "string", "description": name + "-relative path; omit for the root"},
+		"command": map[string]any{"type": "string", "enum": cmds,
+			"description": "domain command (allow-list is config-driven); help is always available"},
+		"path":      map[string]any{"type": "string", "description": name + "-relative path; omit for the root (help: the method to explain)"},
 		"recursive": map[string]any{"type": "boolean", "description": "browse: bounded tree instead of one level"},
 	}
 	if hasAny(d.Commands, "read") {
@@ -103,8 +103,8 @@ func (s *Server) domainSchema(name string) map[string]any {
 		props["content"] = map[string]any{"type": "string", "description": "write: file text (directories end with /)"}
 		props["append"] = map[string]any{"type": "boolean", "description": "write: append instead of truncate"}
 	}
-	if hasAny(d.Commands, "execute") {
-		props["queue"] = map[string]any{"type": "string", "description": `playground path to the queue file — a bare JSON array [{"tool": "...", "params": {...}}]; the launch input of {command: "execute"}`}
+	if toolbox {
+		props["queue"] = map[string]any{"type": "string", "description": `playground path to the queue file — a JSON array [{"tool": "...", "params": {...}}] or the {"defaults": {...}, "jobs": [...]} envelope (defaults merge into every line); the finished wave is stamped back into the file as a "wave" block (result + debug tail; ignored on read, so a stamped queue resubmits); a comma-separated set of files merges into ONE wave; the launch input of {command: "execute"} and the dry-run input of {command: "check"}`}
 		props["wave"] = map[string]any{"type": "string", "description": `result lookup: "latest" or a wave id`}
 	}
 	return map[string]any{"type": "object", "properties": props}
@@ -134,4 +134,9 @@ func allowedVisible(commands []string) []string {
 	return out
 }
 
-func artifactURL(rel string) string { return "/artifacts/" + strings.TrimPrefix(rel, "/") }
+// nestURL is a file address in the shared namespace (SPECS §3.1):
+// GET /nest/<domain>/<rel> — the domain is always spelled out, so a copied
+// URL never shadows another mount.
+func nestURL(domain, rel string) string {
+	return "/nest/" + domain + "/" + strings.TrimPrefix(rel, "/")
+}

@@ -18,7 +18,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package llm is a thin OpenAI-protocol client for the VRAM XOR
-// (REBUILD §2.5): before a wave with gpu-require > 0 the daemon washes out
+// (SPECS §8): before a wave with gpu-require > 0 the daemon washes out
 // the chat model through the provider (list loaded via /v1/models, then
 // POST /models/unload). Best-effort by contract: the caller swallows
 // errors, the wave still runs. Reload is the chat frontend's business,

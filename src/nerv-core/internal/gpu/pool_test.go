@@ -61,6 +61,28 @@ func TestParseNVIDIAPure(t *testing.T) {
 	}
 }
 
+func TestParseROCMPure(t *testing.T) {
+	report := "========== ROCm System Management Interface ==========\n" +
+		"GPU, Product Name\n" +
+		"card0, Radeon RX 7900 XTX\n" +
+		"card2, \"Radeon Pro W7900\"\n" +
+		"card3,\n"
+	slots, err := parseROCm(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 3 || slots[0].Backend != "rocm" || slots[1].Index != 1 {
+		t.Fatalf("parse wrong: %+v", slots)
+	}
+	if !strings.Contains(slots[0].Name, "7900 XTX") || slots[1].Name != "Radeon Pro W7900" ||
+		slots[2].Name != "amdgpu" {
+		t.Errorf("names wrong: %+v", slots)
+	}
+	if _, err := parseROCm("GPU, Product Name\n"); err == nil {
+		t.Error("header-only report must be an error (no GPUs reported)")
+	}
+}
+
 func TestPinEnvTable(t *testing.T) {
 	for b, want := range map[string]string{
 		"cuda": "CUDA_VISIBLE_DEVICES", "rocm": "HIP_VISIBLE_DEVICES", "intel": "ONEAPI_DEVICE_SELECTOR",

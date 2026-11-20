@@ -145,7 +145,7 @@ func (sel *Selector) backends() []string {
 }
 
 // Filter returns the slots matching a selector value; "" and "any" mean all
-// slots (the scheduler's backend-agnostic admission, §2.5). Unlike the
+// slots (the scheduler's backend-agnostic admission, SPECS §6.7). Unlike the
 // operator's gpu_backend selector, a job's gpu-backend requirement without
 // @host is host-agnostic: transport to a remote slot is the script's
 // concern, the scheduler only counts it.

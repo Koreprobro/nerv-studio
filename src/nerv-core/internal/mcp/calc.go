@@ -27,8 +27,9 @@ import (
 
 // callCalcResolution answers the calc.resolution utility: an aspect string
 // in, generator-friendly WxH out. Pure arithmetic — no volume budget, no GPU.
-// The studio defaults (multiple 32, 2 MP target, sides 512..1536) are what
-// the image tools expect on their required width/height fields.
+// The studio defaults (multiple 32, 2 MP target, 512 px side floor, no
+// ceiling) are what the image tools expect on their required width/height
+// fields.
 func (s *Server) callCalcResolution(args map[string]any) ToolResult {
 	aspect := strings.TrimSpace(asString(args, "aspect"))
 	if aspect == "" {

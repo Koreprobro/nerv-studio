@@ -64,6 +64,116 @@ of sh scripts) is an `execute` grant:
   }
 }
 ```
+## Configuration
+
+Single file, `<project-root>/nerv.json` (or `--config <path>`). Precedence:
+**explicit CLI flag > config file > built-in default**. The CLI accepts both
+spellings (`--ai_url` and `--ai-url`); `--env KEY=VALUE` is repeatable and
+merges over the `env` section. `debug` is flag-only (`--debug`): wave logs
+run in the temp dir and fold into the queue file's `wave` result block.
+Strict JSON: only the exact `_comment` key is ignored (documentation keys
+`_comment_*` warn once and are dropped).
+
+| key | default | role |
+|---|---|---|
+| `domains` | — (required) | the whole storage surface; see the next section |
+| `ai_url` | `http://127.0.0.1:5000/v1` | OpenAI-compatible endpoint used for the VRAM wash-out (your local `llama-server`) |
+| `llm_offload` | `false` | the VRAM XOR: `true` = every loaded chat LLM is unloaded before a wave with GPU jobs, and such waves run blocking; `false` = all waves async |
+| `gpu_backend` | `""` (all detected) | pool filter, `backend[@host][:i or a-b]` terms, e.g. `cuda,rocm:0-1` |
+| `external_gpu` | `""` | anonymous remote slots, `backend@host[:N]`, no detection, no health-check |
+| `port` | `9696` | the single HTTP surface (`/mcp` + `/artifacts`) |
+| `max_output_chars` | `32768` | volume guard for tool-result text; the full dump is re-served with `volume_ack=true` |
+| `env` | `{}` | machine environment mixed **as-is** into every tool launch (caches, thread limits, model dirs); `NERV_*` keys are rejected — that prefix belongs to the scheduler↔sh contract |
+| `media` | built-ins | budgets for bounded content into the consumer context (read/fetch): text caps, image/audio/video preview shape |
+
+On a single-GPU workstation `llm_offload: true` is the switch that makes
+generation and chat share one card: the chat model leaves VRAM for the wave's
+duration and the wave holds the request (SSE progress when the client carries
+a progressToken). This is a *cognitive* setting as much as a hardware one —
+it decides whether the AI can watch its own generation happen.
+
+## Domains: the storage surface
+
+Everything the consumer AI can see on disk is a domain entry:
+
+```json
+"<name>": { "path": "<dir>", "commands": ["read", ...], "hint": "<one-line description>" }
+```
+
+- **`name`** *is* the MCP tool name (`[A-Za-z0-9_.-]`, reserved names aside) —
+  the word the model types and reads all day. Naming is vocabulary design.
+- **`path`** — absolute, or relative to the project root (never the launch
+  cwd). The `mount` domain's directory is created on startup.
+- **`commands`** — the allow-list the tool answers; a forbidden command
+  returns `isError` with the available list. `fullRawAccess: true` ignores
+  the allow-list entirely (escape hatch, not a norm).
+- **`hint`** — lands verbatim in `tools/list`; for a language model this is
+  not decoration but *the first line of instruction* for the domain.
+
+The command set:
+
+| command | grants |
+|---|---|
+| `browse` | directory listing (one level, or bounded recursive) |
+| `probe` | metadata: file stats, media dimensions, safetensors headers; in an `execute` toolbox — the `--tool-info` dialect |
+| `read` | bounded text/image reading with line/byte windows |
+| `fetch` | take a file's bytes (artifact) into the workspace |
+| `write` | create / overwrite / append text files (directories by trailing `/`) |
+| `mount` | **structural:** this is *the* playground — the io jail for jobs, the queue-file home, `/artifacts` HTTP serving, wave lineage. Exactly one domain |
+| `execute` | **structural:** this is a *toolbox* — queue `tool` names resolve to `<path>/<tool>.sh`, waves launch from here. Zero, one or many |
+
+## Tuning the environment to a cognitive paradigm
+
+What the consumer AI believes it *is* and *can do* in your studio equals the
+set of tools it sees, multiplied by their descriptions. nerv exposes three
+dials, all pure configuration:
+
+1. **Capabilities — the command allow-list.** Grants are your permission
+   model: a read-only library domain (`read`, `probe`) cannot be scribbled
+   in; a scratch domain (`write`) without `browse` is a mailbox, not a
+   cabinet. Trim grants to the role you are assigning, not to the filesystem.
+2. **Behavior — the hint.** A domain hint is cheapest prompt-engineering
+   that exists: "read README.md first; each doc names the next step and the
+   file to write" turns a directory of notes into a *procedure* the AI
+   walks. Discipline conventions live here too: "one chat = one project =
+   one directory; create `<project>/` first" — the mount's hint carries it.
+3. **World shape — which domains exist and what they are called.** Domain
+   names become the model's nouns. A studio that separates `kb` (guides),
+   `plots` (writing workspace) and `artifactory` (products) teaches the
+   model that knowing, drafting and producing are different acts.
+
+Some worked paradigms (all of them are just nerv.json):
+
+- **Minimal generation bench** — `tools` (execute) + one mounted playground.
+  The AI is a hands-on operator: probe a tool, write a queue, fetch a result.
+- **Guided studio (kb walk).** Add `kb` with `read`+`probe` and a README.md
+  entry point; the guide chain (each document naming its next step and the
+  file to write) makes multi-phase workflows — brief → script → shots →
+  assembly — drive the AI from disk instead of from chat memory. Knowledge
+  is a file tree, not a system prompt.
+- **Writing desk.** `plots` with `read`+`write`+`browse` and no toolbox at
+  all: a pure-text studio for a writing agent (world bibles, characters,
+  drafts). No GPU, no waves — the daemon is still the AI's whole filesystem
+  API.
+- **Library vs workbench.** Mount the same corpus twice with different
+  grants: a weight store as `browse,probe,fetch` (read from outside by the
+  sh scripts; the AI inspects it but never edits it) beside a writable
+  working copy for experiments.
+- **Multi-toolbox.** Several `execute` domains (`image`, `video`, `media`)
+  split the tool surface into explicit rooms: queue names resolve inside one
+  toolbox, no cross-toolbox fallback — the AI chooses a room, not a global
+  namespace with 40 tools in it.
+- **Heavy pipelines as queues.** Because a wave is a file-existence
+  dataflow inside the daemon, a cognitive style of *plan on disk, run async,
+  look up later* is available with zero client code: write the queue, fire
+  `execute`, keep thinking; poll
+  `{"command":"execute","wave":"latest"}` or `POST /wave/stop` (the red
+  button) when needed.
+
+Rules of thumb: use **grants** for safety posture, **hints** for culture,
+**names** for vocabulary, and per-tool `hidden` fields (with defaults) to
+keep knobs out of the model's face. The config is the studio's score; the AI
+is playing it.
 
 ## Running a wave
 
@@ -90,7 +200,9 @@ mode:
 
 `{ "command": "execute", "wave": "latest" }` (or a wave id) answers a live
 snapshot or the final result: jobs with `status` / `dur` / `slots`, `outputs`
-with `artifactURL`, and `archived`. The ledger keeps the last 32 waves.
+with `artifactURL`, and `archived`. With `--debug`, the wave log folds into
+the queue file itself as `wave.debug` — the queue file becomes the complete
+record of its own run. The ledger keeps the last 32 waves.
 
 ## Writing your own tool
 
@@ -107,6 +219,8 @@ contract:
 - exit 0 plus all declared output files present means done; the core creates
   the output's parent directory and archives a same-name old file before the
   script starts.
+
+See `tools/anima-aestetic.sh` for a complete worked example.
 
 ## Documentation
 

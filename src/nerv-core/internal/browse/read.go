@@ -20,12 +20,31 @@
 package browse
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// sniffKind reports the detected mime of a file and whether its first 512
+// bytes carry a NUL — the binary marker the read/fetch doors gate on
+// (SPECS §3.3): each door sends the other's content type away with a
+// pointer instead of ingesting it. A failed open is an error to the
+// caller, never a verdict: the door must let the real os error speak.
+func sniffKind(abs string) (string, bool, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return "application/octet-stream", true, err
+	}
+	defer f.Close()
+	b := make([]byte, 512)
+	n, _ := f.Read(b)
+	b = b[:n]
+	return http.DetectContentType(b), bytes.IndexByte(b, 0) >= 0, nil
+}
 
 // Text is read output: a byte-capped window with a paging note.
 type Text struct {
@@ -44,6 +63,14 @@ func (d *Domain) Read(path, linesSpec, bytesSpec string, maxBytes int) (*Text, e
 	abs, err := d.Resolve(path)
 	if err != nil {
 		return nil, err
+	}
+	// The text door: binary content is not ingested as mojibake — the AI
+	// is sent to the media door (or to probe for metadata) instead. An
+	// unreadable file skips the gate and fails on its real error below.
+	if mime, binary, err := sniffKind(abs); err == nil && (binary ||
+		strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "audio/") ||
+		strings.HasPrefix(mime, "video/")) {
+		return nil, fmt.Errorf("read takes text: %q is binary (%s) — use fetch to take the file, probe for metadata", path, mime)
 	}
 	b := d.effective()
 	if maxBytes <= 0 {

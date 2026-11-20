@@ -18,7 +18,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package browse is the single mechanism behind the domain tools
-// kb/artifactory/tools/loras (REBUILD §2.2, §2.6): one jail by
+// kb/artifactory/tools/loras (SPECS §3.3, §3.7): one jail by
 // construction (a root + this code), commands ls/probe/read/fetch/write,
 // bounded output everywhere. Subdirectories are supported always; the
 // flat layout of kb/tools is authoring style, not a contract.
