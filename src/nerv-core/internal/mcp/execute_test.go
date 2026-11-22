@@ -488,6 +488,48 @@ func TestQueueEnvelopeDefaults(t *testing.T) {
 	}
 }
 
+// Scoped defaults (SPECS §6.1): a {"defaults": ...} line governs the lines
+// that follow within its file — later declarations layer over earlier ones
+// (and over the envelope base), the job line wins; the scope never crosses
+// into the next file of the set, and directive lines are not jobs (the
+// sub-ledger counts the jobs, not the array entries).
+func TestQueueScopedDefaults(t *testing.T) {
+	ts, art := fixture(t)
+	q1 := writeQueue(t, art, "sd.json", `[
+	  {"_comment": "batch header", "defaults": {"tool": "echo", "params": {"text": "h1"}}},
+	  {"params": {"output": "sd1.txt"}},
+	  {"defaults": {"params": {"text": "h2"}}},
+	  {"params": {"output": "sd2.txt"}},
+	  {"params": {"text": "own", "output": "sd3.txt"}}]`)
+	q2 := writeQueue(t, art, "sd-b.json", `{"defaults": {"tool": "echo", "params": {"text": "per-file"}},
+	  "jobs": [{"params": {"output": "sd4.txt"}},
+	           {"defaults": {"params": {"text": "scoped"}}},
+	           {"params": {"output": "sd8.txt"}}]}`)
+	q3 := writeQueue(t, art, "sd-c.json", `[{"params": {"output": "sd6.txt"}},
+	  {"tool": "echo", "params": {"output": "sd7.txt", "text": "plain"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": q1 + "," + q2 + "," + q3})
+	if res.IsError {
+		t.Fatalf("scoped defaults execute: %s", firstText(res))
+	}
+	awaitWave(t, ts, waveIDOf(t, res))
+	for name, want := range map[string]string{
+		"sd1.txt": "h1", "sd2.txt": "h2", "sd3.txt": "own",
+		"sd4.txt": "per-file", "sd8.txt": "scoped", "sd7.txt": "plain",
+	} {
+		b, err := os.ReadFile(filepath.Join(art, name))
+		if err != nil || string(b) != want {
+			t.Errorf("%s = %q (%v), want %q", name, b, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(art, "sd6.txt")); !os.IsNotExist(err) {
+		t.Errorf("defaults must not leak between files; the tool-less sd6 job should have skipped: %v", err)
+	}
+	w := readWaveBlock(t, art, "sd.json")
+	if sub, _ := w["jobs"].([]any); len(sub) != 3 {
+		t.Errorf("directive lines are not jobs: %v", w["jobs"])
+	}
+}
+
 // The wave block lands back in the queue file (SPECS §6.1): the bare array
 // is promoted to the envelope, verdict and sub-ledger ride in "wave", and
 // resubmitting the stamped file reshoots the same recipe (the block is
@@ -519,6 +561,104 @@ func TestWaveBlockWriteBack(t *testing.T) {
 	awaitWave(t, ts, id2)
 	if w2 := readWaveBlock(t, art, "q.json"); w2["wave"] != id2 {
 		t.Errorf("reshoot must restamp the queue file: %v", w2)
+	}
+}
+
+// A "{{a|b}}" variant list rolls at launch: the backend receives the resolved
+// string only, the stamped line keeps the template, and the stamp carries
+// what was picked as "resolved" (SPECS §6.1).
+func TestQueueVariants(t *testing.T) {
+	ts, art := fixture(t)
+	rel := writeQueue(t, art, "dyn.json", `[{"tool":"echo","params":{"text":"mood {{calm|storm}}","output":"d1.txt"}},{"tool":"echo","params":{"text":"{{plain}}","output":"d2.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": rel})
+	if res.IsError {
+		t.Fatalf("execute with variants: %s", firstText(res))
+	}
+	awaitWave(t, ts, waveIDOf(t, res))
+	b1, err := os.ReadFile(filepath.Join(art, "d1.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1 := strings.TrimSpace(string(b1))
+	if s1 != "mood calm" && s1 != "mood storm" {
+		t.Errorf("the fired string must be one option, got %q", s1)
+	}
+	b2, err := os.ReadFile(filepath.Join(art, "d2.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(b2)); got != "{{plain}}" {
+		t.Errorf("the pipe-guard must leave {{plain}} literal, got %q", got)
+	}
+	// Lineage: the line keeps the recipe, the sub-ledger keeps the fire.
+	raw, err := os.ReadFile(filepath.Join(art, "dyn.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Jobs []struct {
+			Params map[string]any `json:"params"`
+		} `json:"jobs"`
+		Wave struct {
+			Jobs []map[string]any `json:"jobs"`
+		} `json:"wave"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("stamped file: %v", err)
+	}
+	if len(doc.Jobs) != 2 || doc.Jobs[0].Params["text"] != "mood {{calm|storm}}" {
+		t.Fatalf("the stamped line must keep the template: %s", raw)
+	}
+	if len(doc.Wave.Jobs) != 2 {
+		t.Fatalf("sub-ledger: %v", doc.Wave.Jobs)
+	}
+	rv, _ := doc.Wave.Jobs[0]["resolved"].(map[string]any)
+	if rv["text"] != s1 {
+		t.Errorf("sub-ledger resolved = %v, fired was %q", rv["text"], s1)
+	}
+	if _, leaked := doc.Wave.Jobs[1]["resolved"]; leaked {
+		t.Errorf("the guarded line must have no resolved: %v", doc.Wave.Jobs[1])
+	}
+}
+
+// A "_comment" key is free annotation (SPECS §6.1): the scheduler ignores it
+// on read (Check guards params keys only) and the wave stamp preserves it at
+// both the envelope and the job level — the shoot-log annotation survives
+// the fire, in the envelope form and in the promoted bare array alike.
+func TestQueueCommentKeys(t *testing.T) {
+	ts, art := fixture(t)
+	q1 := writeQueue(t, art, "cmt.json", `{
+	  "_comment": "wave: cover pass 1",
+	  "jobs": [{"_comment": "board row S1", "tool": "echo", "params": {"text": "a", "output": "cmt1.txt"}}]}`)
+	q2 := writeQueue(t, art, "cmt2.json", `[{"_comment": "cite S2", "tool": "echo", "params": {"text": "b", "output": "cmt2.txt"}}]`)
+	res, _ := call(t, ts, "tools", map[string]any{"command": "execute", "queue": q1 + "," + q2})
+	if res.IsError {
+		t.Fatalf("execute with _comment: %s", firstText(res))
+	}
+	awaitWave(t, ts, waveIDOf(t, res))
+	for _, tt := range []struct{ file, envelope, line string }{
+		{"cmt.json", "wave: cover pass 1", "board row S1"},
+		{"cmt2.json", "", "cite S2"},
+	} {
+		raw, err := os.ReadFile(filepath.Join(art, tt.file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var obj struct {
+			Comment string `json:"_comment"`
+			Jobs    []struct {
+				Comment string `json:"_comment"`
+			} `json:"jobs"`
+		}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			t.Fatalf("stamped %s: %v (%s)", tt.file, err, raw)
+		}
+		if obj.Comment != tt.envelope {
+			t.Errorf("%s: envelope _comment = %q, want %q (%s)", tt.file, obj.Comment, tt.envelope, raw)
+		}
+		if len(obj.Jobs) != 1 || obj.Jobs[0].Comment != tt.line {
+			t.Errorf("%s: job _comment must survive the stamp (%s)", tt.file, raw)
+		}
 	}
 }
 

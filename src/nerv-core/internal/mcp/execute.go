@@ -47,15 +47,16 @@ type executeAnswer struct {
 }
 
 type answeredJob struct {
-	Index       int      `json:"index"`
-	Tool        string   `json:"tool"`
-	Outputs     []string `json:"outputs,omitempty"`
-	Archived    []string `json:"archived,omitempty"` // old same-name files: name-<i>.ext
-	ArtifactURL []string `json:"artifactURL,omitempty"`
-	Status      string   `json:"status"`
-	Error       string   `json:"error,omitempty"`
-	Dur         string   `json:"dur,omitempty"`
-	Slots       []string `json:"slots,omitempty"`
+	Index       int               `json:"index"`
+	Tool        string            `json:"tool"`
+	Outputs     []string          `json:"outputs,omitempty"`
+	Archived    []string          `json:"archived,omitempty"` // old same-name files: name-<i>.ext
+	ArtifactURL []string          `json:"artifactURL,omitempty"`
+	Status      string            `json:"status"`
+	Error       string            `json:"error,omitempty"`
+	Dur         string            `json:"dur,omitempty"`
+	Slots       []string          `json:"slots,omitempty"`
+	Resolved    map[string]string `json:"resolved,omitempty"` // variant picks that fired (SPECS §6.1)
 }
 
 // callExecute is the wave launch point and the wave ledger lookup (SPECS §6.1),
@@ -113,6 +114,7 @@ func (s *Server) callExecute(toolbox string, w http.ResponseWriter, r *http.Requ
 	// daemon shutdown or POST /wave/stop.
 	wctx, cancel := context.WithCancel(s.waveCtx)
 	wv := s.newWave(mode, tag, toolbox, files, adm, skipped, wctx, cancel)
+	wv.resolved = resolvedOf(queue) // the fired picks ride the stamp (SPECS §6.1)
 
 	// Blocking wave: the answer rides one SSE stream (SPECS §6.6). Headers
 	// and a ": wave" comment flush before the submit, so a client or proxy
@@ -284,6 +286,11 @@ func (s *Server) readQueueSet(args map[string]any) (queue []job.Job, files []que
 	if len(files) == 0 {
 		return nil, nil, fmt.Errorf(`execute needs a non-empty {"queue": "<path>[, <path>...]"}`)
 	}
+	// Dynamic-prompt variant lists roll their picks before admission: the
+	// backend never sees the sigil (SPECS §6.1).
+	for i := range queue {
+		queue[i].ResolveVariants()
+	}
 	return queue, files, nil
 }
 
@@ -297,20 +304,22 @@ func (s *Server) waveResult(wv *wave) ToolResult {
 
 // parseQueueFile reads one queue file (SPECS §6.1): a bare JSON array of
 // {tool, params} lines, or the envelope {"defaults": {...}, "jobs": [...],
-// "wave": {...}}. Defaults merge into every line via job.MergeDefaults; the
-// daemon-written "wave" block is ignored on read — resubmitting a finished
-// queue reshoots the same recipe.
+// "wave": {...}}. A line carrying a top-level "defaults" key is a scoped
+// directive: it governs the lines that follow it within this file, later
+// declarations layering over earlier ones (expandLines). The daemon-written
+// "wave" block is ignored on read — resubmitting a finished queue reshoots
+// the same recipe.
 func parseQueueFile(raw []byte) ([]job.Job, error) {
 	if firstByte(raw) == "[" {
-		var qs []job.Job
-		if err := json.Unmarshal(raw, &qs); err != nil {
+		var lines []json.RawMessage
+		if err := json.Unmarshal(raw, &lines); err != nil {
 			return nil, err
 		}
-		return qs, nil
+		return expandLines(lines, job.Job{})
 	}
 	var env struct {
-		Defaults *job.Job  `json:"defaults"`
-		Jobs     []job.Job `json:"jobs"`
+		Defaults *job.Job          `json:"defaults"`
+		Jobs     []json.RawMessage `json:"jobs"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf(`want a JSON array or the {"defaults"?, "jobs", "wave"?} envelope (SPECS §6.1): %v`, err)
@@ -318,12 +327,42 @@ func parseQueueFile(raw []byte) ([]job.Job, error) {
 	if len(env.Jobs) == 0 {
 		return nil, fmt.Errorf(`envelope needs a non-empty "jobs" array`)
 	}
-	if d := env.Defaults; d != nil {
-		for i := range env.Jobs {
-			env.Jobs[i].MergeDefaults(*d)
-		}
+	active := job.Job{}
+	if env.Defaults != nil {
+		active = *env.Defaults
 	}
-	return env.Jobs, nil
+	return expandLines(env.Jobs, active)
+}
+
+// expandLines walks the raw lines of one file's jobs array behind an active
+// defaults template. A line with a top-level "defaults" key is a scoped
+// directive (SPECS §6.1): it layers over the active template — the later
+// declaration wins per key, silence keeps the earlier value — and governs
+// the lines that follow, within this file only (a multi-file set keeps each
+// file's scope to itself). A job line merges under the active template; the
+// line wins per key. Directives are not jobs and never reach the ledger.
+func expandLines(lines []json.RawMessage, active job.Job) ([]job.Job, error) {
+	var jobs []job.Job
+	for i, raw := range lines {
+		var probe struct {
+			Defaults *job.Job `json:"defaults"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			return nil, fmt.Errorf("line %d: %v", i, err)
+		}
+		if probe.Defaults != nil {
+			probe.Defaults.MergeDefaults(active)
+			active = *probe.Defaults
+			continue
+		}
+		var j job.Job
+		if err := json.Unmarshal(raw, &j); err != nil {
+			return nil, fmt.Errorf("line %d: %v", i, err)
+		}
+		j.MergeDefaults(active)
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
 }
 
 // jobDisplay names a job for the human progress lines: the stem of its
@@ -357,6 +396,7 @@ func (w *wave) mapAnswer(res scheduler.Result) executeAnswer {
 	for _, j := range res.Jobs {
 		a := answeredJob{Index: j.Index, Tool: j.Tool, Outputs: j.Outputs, Archived: j.Archived,
 			Status: j.Status, Error: j.Error, Dur: j.Dur, Slots: j.Slots}
+		a.Resolved = w.resolved[j.Index] // the fired pick, if the line held a variant list
 		for _, o := range j.Outputs {
 			a.ArtifactURL = append(a.ArtifactURL, nestURL(w.Mount, o))
 		}
@@ -367,6 +407,22 @@ func (w *wave) mapAnswer(res scheduler.Result) executeAnswer {
 		out.Jobs = []answeredJob{}
 	}
 	return out
+}
+
+// resolvedOf harvests the variant picks of a parsed queue by position:
+// the wave's job numbering follows the queue order, skips included
+// (SPECS §6.1).
+func resolvedOf(queue []job.Job) map[int]map[string]string {
+	var m map[int]map[string]string
+	for i := range queue {
+		if len(queue[i].Resolved) > 0 {
+			if m == nil {
+				m = map[int]map[string]string{}
+			}
+			m[i] = queue[i].Resolved
+		}
+	}
+	return m
 }
 
 func prettyJSON(v any) string {

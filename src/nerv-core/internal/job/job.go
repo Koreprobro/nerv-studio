@@ -55,6 +55,11 @@ type Job struct {
 	// script untouched as NERV_<FIELD> env vars.
 	Params map[string]any `json:"params,omitempty"`
 
+	// Resolved records the params whose variant lists fired at launch
+	// (SPECS §6.1): the queue line keeps the template, the wave stamp
+	// carries what was picked. Set by ResolveVariants, omitted when empty.
+	Resolved map[string]string `json:"resolved,omitempty"`
+
 	// --- scheduler runtime state ---
 	Status Status     `json:"status,omitempty"`
 	Error  string     `json:"error,omitempty"`

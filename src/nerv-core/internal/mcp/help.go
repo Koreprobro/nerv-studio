@@ -76,7 +76,7 @@ var helpDocs = map[string]cmdDoc{
 	"execute": {
 		summary: "run a wave of jobs from a queue file and wait for its answer",
 		full: `execute — run a wave of jobs through the toolbox.
-  queue — a queue file in the playground: a JSON array of jobs [{"tool": ..., "params": {...}}] or the {"defaults": ..., "jobs": [...]} envelope (defaults merge into every line; the line wins per key). Several files separated by "," merge into ONE wave.
+  queue — a queue file in the playground: a JSON array of jobs [{"tool": ..., "params": {...}}] or the {"defaults": ..., "jobs": [...]} envelope. A line with a top-level "defaults" key is a scoped directive: it merges into the lines that follow, within this file only; a later declaration wins per key, the job line wins over every defaults. "_comment" rides along at any level — ignored by the scheduler, kept by the stamp. Several files separated by "," merge into ONE wave. A {{a|b}} list inside a string param picks one option at launch (weighted: {{0.7::a|0.3::b}}); the job's seed replays the pick, the stamp records what fired; backslash+{{ escapes.
   wave="latest" or a wave id — look up a finished wave instead of launching a new one.
   The wave's answer is stamped back into the queue file; relaunching a stamped file reshoots it.`,
 	},

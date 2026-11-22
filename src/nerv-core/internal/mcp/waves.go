@@ -78,6 +78,7 @@ type wave struct {
 	Ended    time.Time
 
 	adm        []*scheduler.Admitted
+	resolved   map[int]map[string]string // variant picks per queue index, harvested at launch (SPECS §6.1)
 	Skipped    []scheduler.Skipped
 	byJob      map[*job.Job]int
 	ctx        context.Context

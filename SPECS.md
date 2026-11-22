@@ -27,7 +27,9 @@ The daemon derives the project root from its own location:
 ├── src/nerv-gui/          web client (pure MCP client)
 ├── tools/                 consumer sh toolbox (*.sh, self-documenting)
 ├── kb/                    knowledge base (*.md, README.md is the entry)
+├── docs/                  development material (not consumer kb)
 ├── nerv.json              runtime configuration (sample: nerv.json.example)
+├── nerv-core.service      systemd user unit (symlinked from ~/.config/systemd/user/)
 └── Makefile               build | test | vet | clean
 ```
 
@@ -46,8 +48,8 @@ to start. The shipped studio uses four domains by author's convention:
 | `artifactory`   | `/storage/out`   | artifact repository — the consumer-AI playground; grants `mount` |
 | `loras`         | `/ai/loras`      | model/LoRA weights store                               |
 
-There is no `logs` root: the wave log lives beside its queue file (§6.6),
-written only with `--debug`.
+There is no `logs` root: the `--debug` wave log runs in the system temp dir
+and folds into its queue file's wave block (§6.6).
 
 Flat is the shipped default, **not a contract**: subdirectories are valid in
 every domain (the browse mechanism supports trees; the listing bounds are
@@ -85,7 +87,7 @@ Built-in defaults < `nerv.json` < **explicitly passed** CLI flags
 | `llm_offload`      | `false`                       | VRAM XOR + blocking GPU waves (§8) |
 | `gpu_backend`      | `` (greedy scoop)             | pool selector `backend[@host][:i|a-b]` |
 | `external_gpu`     | ``                            | remote slots `backend@host[:N]`, N default 1 |
-| `port`             | `9696`                        | the single HTTP port (`/mcp` + `/artifacts`) |
+| `port`             | `9696`                        | the single HTTP port (`/mcp` + `/nest`) |
 | `max_output_chars` | `32768`                       | volume guard for tool-result text (§3.5) |
 | `env`              | `{}`                          | machine env mixed into every launch, as-is (LoRA store: `LORA_MODEL_DIR`) |
 | `media`            | built-in budgets (§3.3)       | read/fetch budget defaults |
@@ -108,9 +110,15 @@ must still serve the studio. The pool is frozen at startup and never mutated.
 ### 3.1 Transport
 
 Single HTTP server on `port`: `POST /mcp` (JSON-RPC 2.0, streamable HTTP —
-SSE responses for long waves) and `GET /artifacts/<rel>` (the `mount` domain;
-the `artifacts/` prefix folds out of any path the client hands back —
-`job.NormalizePath`).
+SSE responses for long waves), `POST /wave/stop` (the red button outside
+MCP — §6.6) and `GET /nest/<domain>/<rel>` — the file-serving surface of
+every storage domain **except** `execute`-granted toolboxes (a toolbox is a
+capability, not a file: script sources never enter the consumer's context
+by URL). A domain answer's `artifactURL` is exactly this URL. The
+`nest/<active mount>/` prefix folds out of any path the client hands back
+(`job.NormalizePath`) into a playground-relative io path; a path naming
+another nestable domain stays a literal io path (it fails existence until
+the file is copied into the playground).
 
 Methods: `initialize` (version negotiation against `ProtocolVersion =
 2026-07-28`: the server answers with the client's version when the client
@@ -133,9 +141,6 @@ configuration yields:
 5. `dice.roll` — utility (§7.1)
 6. `calc.resolution` — utility (§7.2)
 
-`gpu.list` (hidden operator diagnostic: pool slots + live load) is reachable
-by name but never listed.
-
 ### 3.3 Domain commands
 
 Every domain shares one browse mechanism (`internal/browse`); every path is
@@ -145,18 +150,24 @@ jail-checked (no absolute, no `..`):
 |-----------|-----------|
 | `browse`  | one level; `recursive=true` gives a bounded tree (depth 3, 128/dir, 512 entries) |
 | `probe`   | metadata only (size/mtime/mime/sniff; image WxH, ffprobe fields, safetensors header) |
-| `read`    | bounded text window; `lines="A-B"` or `bytes="A-B"` (1-based, inclusive, sides optional, mutually exclusive), capped by `max_bytes` |
-| `fetch`   | media into the block budget: images degrade (quality, then dimensions) via stdlib; audio/video via ffmpeg (thumbnail/clip); else raw passthrough |
+| `read`    | bounded text window; `lines="A-B"` or `bytes="A-B"` (1-based, inclusive, sides optional, mutually exclusive), capped by `max_bytes`; the text door: binary content is refused with a pointer to `fetch`/`probe` |
+| `fetch`   | media into the block budget: images degrade (quality, then dimensions) via stdlib; audio/video via ffmpeg (thumbnail/clip); else raw passthrough; the media door: plain text is refused with a pointer to `read` |
 | `write`   | text files only (extension allowlist), `content` + optional `append`; a trailing `/` means `mkdir` |
+| `help`    | the always-available manual: no `path` lists the commands this domain answers to (one WHAT-line each), `path="<method>"` explains one method — its purpose, its parameters, the door boundaries; implementation details stay out of the consumer's creative context |
 
 Per-domain **allow-lists** (the `commands` field) gate which commands the
 consumer may call; a forbidden command answers `isError` with the available
-list. A call with `fullRawAccess=true` ignores the allow-list entirely
+list. `help` stands outside the allow-list — every domain answers it, and its
+listing reflects the actual grants (on an `execute`-granted domain the `probe`
+entry speaks the tool-info dialect and the `execute`/`check` pair is listed).
+A call with `fullRawAccess=true` ignores the allow-list entirely
 (the GUI/operator escape hatch; hidden probe fields and raw-tagged waves
 become visible too). Two entries of the allow-list are structural grants
 rather than plain commands (§3.7): `mount` (a property, never callable) and
 `execute` (callable: `{"command": "execute", "queue": …}` /
-`{"command": "execute", "wave": …}`). On an `execute`-granted domain the
+`{"command": "execute", "wave": …}`), with `check` as its callable
+companion (`{"command": "check", "queue": …}` — the dry run, §6.1). On an
+`execute`-granted domain the
 `probe` command — and a bare call with no command — speaks the tool-info
 dialect instead of the file sniff.
 
@@ -176,7 +187,10 @@ itself (`hint`). Adding a directory to the surface is a config edit.
 Any tool-result TEXT over `max_output_chars` is refused (`isError`) with a
 head preview and the escape hatch revealed: re-send with
 `volume_ack=true` for the full dump — a deliberate two-step dump, never an
-accident. Media blocks carry their own budget (§3.3) and are not guarded.
+accident. The cap holds on **both transports**: JSON answers and the final
+event of a streamed blocking wave alike (on the stream a finished wave is one
+`execute wave="<id>"` away — a lookup reshoots nothing). Media blocks carry
+their own budget (§3.3) and are not guarded.
 
 ### 3.6 Redaction
 
@@ -185,12 +199,29 @@ startup from the config — the project root becomes `<project>/`, every
 domain root becomes `<domain-name>/` (longest root first, so a nested root
 redacts to its own, deeper tag).
 
+Redaction is enforced at the **response boundary**, not per error site:
+every text block of every tool result passes through the redactor on both
+transports (plain JSON, and the final event of a blocking SSE stream), and
+progress notification lines pass through it too. Error texts, file
+content (a stamped queue file may carry wave-debug tails quoting absolute
+vendor paths; paths the job itself writes are relative by construction —
+§5) and wave blocks are all mapped; base64 media blocks pass through
+untouched.
+
+The surface is the consumer-AI's **jail**: its world is relative paths
+and `<name>` root tags, and a full server path survives only in debug
+artifacts (the wave log file on disk). The system temp directory redacts
+to `<tmp>/`; any other standalone absolute token (two or more segments)
+collapses to `<path>/basename`. URLs — including the studio's own
+`/nest/` links — are not server filesystem paths and pass through
+untouched.
+
 ### 3.7 Generic storage domains
 
 The storage surface is one generic `domains` map: directory name and path
 are pure configuration, the MCP tool name is the domain name (validated:
 MCP tool-name grammar `[A-Za-z0-9_.-]{1,64}`, no collision with the utility
-names `dice.roll`/`calc.resolution`/`gpu.list`, non-empty path), and
+names `dice.roll`/`calc.resolution`, non-empty path), and
 `tools/list` is generated by iterating the map (sorted by name). There are
 no default directories: a config without domains — or without exactly one
 `mount` — is a startup error. A directory's purpose is its capability list —
@@ -207,10 +238,12 @@ surface:
   each is a toolbox with its own `execute`; a queue belongs to the toolbox
   it was submitted through.
 - **`mount` — the domain's root is the playground.** The io path jail
-  root (`io:"in"`/`io:"out"` absolutization), the queue-file location,
-  the `/artifacts` HTTP mount, the `artifactURL` annotation, the wave-log
-  location and the wave-answer lineage. Exactly one mount domain,
-  validated at startup; the directory is created when missing.
+  root (io fields arrive playground-relative; existence checks and the
+  store's archive resolve against it), the **job cwd** at launch (§5), the
+  queue-file location, the `/nest/<domain>` HTTP serving, the `artifactURL`
+  annotation, the wave-log location and the wave-answer lineage. Exactly
+  one mount domain, validated at startup; the directory is created when
+  missing.
 
 ```json
 "domains": {
@@ -229,12 +262,18 @@ Invariants:
 - **io stays single-rooted**: files of non-mount domains enter queues
   only as plain params or operator env (weights already do); there is no
   root discriminator in the lineage.
-- **logs is not a root at all**: the wave log is a file beside its queue
-  file (§6.6), written only with the `--debug` flag.
+- **logs is not a root at all**: the `--debug` wave log is transient (system
+  temp) and ends up folded into the queue file's wave block (§6.6).
 - The scheduler takes no configuration of its own: its toolbox directory
   and playground store are resolved from the map (the `execute`- and
   `mount`-domain roots) at startup; the launch contract (§5) does not
   change.
+
+> Legacy config revisions that name separate root keys (`tools`,
+> `artifactory`, `kb`, `lora_model_dir`, `logs`) or the `hints`/`debug`
+> file keys read as unknown keys and warn once at startup; the old root
+> flags (`--tools` &c.) are gone — the remaining flags are `--config`,
+> `--debug` and one flag per runtime key of §2.2.
 
 ---
 
@@ -246,7 +285,9 @@ Invariants:
 env** (`PATH` only) — an unguarded script must not write into the daemon's
 working directory. Stdout must be the JSON below; a non-zero exit or bad JSON
 is the probe error. The tool name may omit the `.sh` suffix (resolution
-tries it first).
+tries it first). The probe is a declaration read, not a job: it stays out of
+the playground so a bare `--tool-info` never touches the consumer's world or
+depends on the launch env (§5.1).
 
 ### 4.2 Grammar
 
@@ -323,18 +364,21 @@ Assembled per job by `scheduler.buildEnv`, in order:
    never injected (the pin env is the device truth):
    - plain fields (no `io`): the value flows verbatim (stringified;
      arrays comma-joined, floats minimal-form, bools `true`/`false`);
-   - `io:"in"` and `io:"out"`: the **FULL ABSOLUTE** path (arrays of paths
-     comma-join absolute entries).
+   - `io:"in"` and `io:"out"`: the **playground-relative** path exactly as
+     the consumer wrote it (arrays of paths comma-join entries). The job
+     runs from the mount root, so the value is directly usable as a file
+     operand (the script's working world is the consumer's world).
 5. **Calculator pair** — when the tool declared both `aspect-ratio` and
    `target-mpx` (§7.3): `NERV_CALCULATED_WIDTH`/`NERV_CALCULATED_HEIGHT`.
 
 The mark is the contract, not the name: the output field may be called
 anything (`file-result`, `output`, …); `"output"` carries no privilege.
 
-Execution: `sh <tool>` in its own process group; cancellation SIGKILLs the
+Execution: `sh <tool>` with **cwd set to the active mount domain's root**, in
+its own process group; cancellation SIGKILLs the
 whole group (generator children die with the wrapper); `WaitDelay` 10 s.
 stdout+stderr stream into a capped 64 KB tail buffer (the failed-tail source)
-and, with `--debug`, additionally into the wave log beside the queue file,
+and, with `--debug`, additionally into the wave log (system temp, §6.6),
 line-prefixed `<index> <tool> | ` (§6.6).
 
 ### 5.1 The closed env surface
@@ -344,13 +388,20 @@ The launch env is exactly `PATH` + pin envs + user `env` + `NERV_<FIELD>` +
 
 - The toolbox anchor is `dirname "$0"` — the daemon launches
   `sh <abs>/<name>.sh`, and the toolbox uses this idiom for its own includes.
+- The **cwd is the playground**: jobs launch from the mount root, so the
+  consumer's world is the script's working directory and `$PWD` is the
+  playground anchor (`external_gpu` transports scp/rsync from `$PWD/rel`).
+  A write to an unguarded relative path lands in the playground — the
+  consumer's writable world — not in the daemon's tree.
 - Text assets live next to the script or arrive as `io:"in"` files — the kb
   is the chat's domain, not a tool's.
-- The io mark is **symmetric**: file fields arrive absolute in both
-  directions, so a script touches files only through its fields and never
-  needs the playground root; scratch paths derive from the out field.
-  Queue files and wave answers keep playground-relative paths —
-  absoluteness is an env-transport concern only (lineage). Outputs
+- The io mark is **symmetric**: file fields arrive playground-relative in
+  both directions — the same string the consumer wrote, the queue file
+  holds and the wave answer echoes; absoluteness is an internal store
+  concern (existence checks and the §6.5 archive resolve against the mount
+  root). A script touches files only through its fields, relative to the
+  cwd, and never needs the playground root by name; scratch paths derive
+  from the out field. Outputs
   additionally: the core has created the parent directory and archived an
   old same-name file before the script starts (§6.5), so the script writes
   the value directly.
@@ -374,8 +425,9 @@ The closure is guarded: the `NERV_` prefix is reserved (user-env rejection,
 ### 6.1 Submission
 
 The launch command is `execute` on an `execute`-granted domain:
-`{"command": "execute", "queue": "<playground-relative path>"}` — a **bare
-JSON array**:
+`{"command": "execute", "queue": "<playground-relative path>"}`. A queue
+file is a **JSON array of lines** or the **envelope** (the daemon reads the
+first non-space byte to tell them apart):
 
 ```json
 [
@@ -385,11 +437,84 @@ JSON array**:
 ]
 ```
 
-No top-level envelope: the file must begin with `[` — the daemon checks the
-first non-space byte and rejects an object envelope by name. The daemon
-reads the file, never mutates it. `{"command": "execute",
+```json
+{ "defaults": { "tool": "krea2", "params": { "prompt": "...", "aspect-ratio": "16:9" } },
+  "jobs":     [ { "params": { "file-result": "proj/shot1.png" } },
+                { "params": { "file-result": "proj/shot2.png", "seed": 7 } } ],
+  "wave":     { } }
+```
+
+`defaults` is a template line merged into every job: top-level fields
+(`tool`) fill only the line's silences, `params` merge key-wise — the
+line's value wins whole (no splice of maps or arrays). `wave` is the
+daemon-written result block (below), ignored on read — a finished queue
+file resubmits as is, a reshoot is safe. An object without a usable `jobs`
+array is rejected by name before the wave starts.
+
+**`_comment` is the file's own annotation:** a free-form string at the
+envelope level or on any job line (a wave's purpose, a board-row citation).
+The scheduler ignores it — typed read, and §6.2 guards `params` keys only —
+and the write-back stamp preserves it, so the annotation survives every
+fire. It belongs beside `tool`/`params`, never inside `params` (there the
+undeclared key would skip the job).
+
+**Scoped `defaults`.** Inside the jobs array (bare or enveloped) a line
+carrying a top-level `"defaults"` key is a **directive, not a job**: its
+body takes the envelope-defaults form, layers over the file's active
+template — the later declaration wins per key, silence keeps the earlier
+value — and governs the lines that follow, **within that file only** (a
+multi-file set leaks no scope). The job line wins over every defaults.
+Directive lines do not count as jobs and never reach the ledger.
+
+**Batches live in the queue, not in the backend.** N job lines sharing one
+defaults header are a batch; the scheduler fans them across the GPU pool,
+which beats the backend's own batch dimension on one GPU. So tool scripts
+pin the backend-native batch to 1 (a literal `batch_size: 1` in the
+workflow) and `--tool-info` never carries a batch field.
+
+**Variant lists — the dynamic prompt, minimal.** A string param may carry
+`{{cat|dog}}` lists: one option is picked at launch and the backend receives
+the resolved string only — the sigil never leaks. `{{0.7::cat|0.3::dog}}`
+picks weighted (a missing weight means 1; an unparsable or negative prefix
+stays option text). The sigil is guarded on two counts — double braces, and
+a pipe on the top level inside — so `{{plain text}}`, single braces (a
+layout-JSON prompt) and bbox brackets pass untouched; a backslash before the
+opener (`\{{a|b}}`) escapes it. Picked options expand in turn, so lists
+nest (`{{photo of {{cat|dog}}|sketch}}`, capped at 8 levels); the guard
+reads each group's own top level — a group without a pipe of its own stays
+literal whole, inner lists included. Options are raw text: whole phrases
+roll, and spaces belong to the option (nothing is trimmed). The pick is seeded from the job's declared `seed` param when
+present — a reshoot of the stamped file reproduces it byte for byte — and
+from process entropy otherwise. The fire is lineage: the queue line keeps
+the template, the sub-ledger records the resolved params per job (`resolved`).
+
+The `queue` argument takes a **set**: one path or a comma-separated list
+(`"proj/q-s1.json, proj/q-s2.json"`), each file holding either shape; all
+files are read and merged in list order into **one wave** — the elephant is
+eaten in parts and fired at once. A file that fails to resolve or parse
+rejects the whole launch before any wave starts; the wave (and its debug
+fold, §6.6) anchors at the first file. `{"command": "check", "queue": …}`
+is the launch's **dry run**: it reads the set and rehearses admission
+(§6.2), answering `{files: [{file, jobs}], jobs, admitted, skipped}` —
+nothing launches, no wave opens, nothing moves on disk; a parse failure or a
+zero-admission set answers `isError` (naming the file / listing the skips).
+`{"command": "execute",
 "wave": "latest"|<id>}` looks a wave up in the ledger (the last 32 waves);
 the lookup answers through any toolbox — the ledger is daemon-wide.
+
+**Wave result write-back.** The queue file is a self-describing ticket:
+recipe in, result out. When the wave ends, the daemon atomically
+(temp file + rename) stamps a `wave` block into every file of the set:
+`{wave, mode, ok, started, finished, jobs}` where `jobs` is the file's own
+sub-ledger on **local** indexes (tool, outputs, archived, artifactURL,
+status, error, dur, plus `resolved` when variant lists fired); the anchor
+file additionally carries `skipped` and,
+with `--debug`, the `debug` tail (plus `debug_note` when truncated). A bare
+array is promoted to the envelope by the stamp; the block never affects a
+later read (reshoot). The stamp is best-effort — a file-write failure is
+reported on stderr and the wave answer stands. A client that died mid-wave
+(chat reload, agent disconnect) recovers from this block: after reconnect,
+read the queue file instead of chasing the lost response.
 
 ### 6.2 Validation (lenient, submit-time)
 
@@ -402,7 +527,7 @@ Per entry (`Job.Check` against the probed interface):
 - every param key must be a **declared** field (public or hidden) — a typo
   cannot leak into the script as an invented env var;
 - fields with a declared default not set by the job receive the default;
-- `io` paths normalize (`artifacts/` fold, clean) and reject absolute or
+- `io` paths normalize (`nest/<active mount>/` fold, clean) and reject absolute or
   `..` paths; `io:"out"` requires a single non-empty path (absent value and
   no default means skip); `io:"in"` accepts a path or an array of paths;
 - failure is **soft**: the entry lands in
@@ -434,7 +559,10 @@ aside to `name-<i>.ext` (index before the extension, counted from 1, first
 free index wins; in-place jobs — an output that is also an input of the same
 job — keep the tool's own overwrite). The consumer-AI always gets exactly
 the output name it declared; conflicts resolve in favor of the new file.
-The same mechanism rotates old wave logs (§6.6).
+
+**Only humans delete.** The consumer surface has no delete verb: the AI
+writes, moves and renames, and the archive above is a *move aside*, never a
+deletion. The playground only grows — pruning is a human privilege.
 
 ### 6.6 Wave execution model
 
@@ -444,17 +572,42 @@ The same mechanism rotates old wave logs (§6.6).
   exclusively).
 - CPU jobs (`gpu-require: 0`) are unlimited — they need no slot.
 - **Modes**: with `llm_offload=true`, a queue containing any `gpu-require > 0`
-  line runs **blocking** — the request waits; SSE `notifications/progress`
-  when the client carries a `progressToken`, plain JSON otherwise. Everything
-  else runs **async** — the wave belongs to the daemon (a disconnect cannot
-  kill it) and the answer returns immediately with the wave id.
+  line runs **blocking** — the answer rides one SSE stream for the wave's
+  life: status headers and a `: wave <id>` comment flush before the submit
+  (a client or proxy never sits on a byteless wait), `notifications/progress`
+  ride the stream when the client carries a `progressToken`, and the final
+  JSON-RPC response closes it. A transport that cannot stream falls back to
+  plain JSON. Everything
+  else runs **async** — the answer returns immediately with the wave id.
+  **Either mode, the wave belongs to the daemon**: a disconnect, a chat
+  reload or a dropped request never kills it; cancellation is explicit only
+  (shutdown or the red button below). A gone client loses nothing: the wave
+  finishes and its result is stamped into the queue files (§6.1) — the
+  consumer reads the file after reconnect instead of chasing the response.
+- **Human progress feed**: the SSE `notifications/progress` payload carries
+  `progressToken`, `message`, `markdown`, `done`/`total` and `wave` — the
+  markdown line is a human-readable console for the GUI: running
+  `▶ shot1 (cuda:0) 3/10`, done `[shot1](/nest/artifactory/proj/shot1.png) ✓ 2m27s`,
+  failed `✖ shot1 — <error> <dur>`. A quiet stream emits an SSE comment
+  keepalive (`: keepalive`) every 30 s — on every blocking stream, token or
+  no token — so neither a proxy nor a client read timeout reaps a long
+  single-job wave mid-render.
+- **Red button**: `POST /wave/stop` (same port, outside MCP) cancels the
+  newest unfinished wave — or `?wave=<id>` — killing its process groups;
+  the wave ends not-ok, stamps its queue files as usual, and the VRAM drain
+  (§8) runs on a fresh clock so the chat can reload into a quiet pool.
+  Idempotent: a press on a finished or absent wave answers `stopped: false`.
+  The GUI needs it because in XOR mode the LLM sleeps through the wave and
+  cannot type "stop".
 - Wave id: wall-clock stamp + daemon counter (`20261110-031222-01`) — unique
   across restarts without a ledger on disk.
-- **Wave log (`--debug`)**: one file beside the queue file,
-  `<queue-stem>.log` (playground-relative), holding the jsonl event lines
-  plus every job's streamed output (line-prefixed `<index> <tool> | `);
-  an old same-name log rotates out through the archive mechanism (§6.5)
-  before the wave opens its own. The wave answer carries the `log` pointer.
+- **Wave log (`--debug`)**: the jsonl event lines plus every job's streamed
+  output (line-prefixed `<index> <tool> | `) go to a transient file in the
+  system temp dir (`$TMPDIR/nerv-wave-<id>.log`); when the wave ends its
+  tail (256 KB cap) is folded into the anchor queue file's `wave.debug`
+  (a `debug_note` marks the truncation) and the temp file is deleted. The
+  playground never holds log files; the ledger view carries the live `log`
+  pointer only while the wave runs.
 - Graceful shutdown: no new submits; queued and running waves finish within
   grace; stragglers get their process groups SIGKILLed.
 
@@ -473,7 +626,7 @@ how many instances of the tool the pool seats at once (the planning number).
 ## 7. Utilities (outside the queue paradigm)
 
 Two helpers live outside the tool/queue machinery — pure in-chat calls that
-never touch the scheduler or the GPU (plus the hidden `gpu.list` diagnostic):
+never touch the scheduler or the GPU:
 
 ### 7.1 `dice.roll`
 
@@ -487,8 +640,10 @@ otherwise a physical draw — `/dev/hwrng` when present, else the kernel CSPRNG
 
 Aspect string in, generator-friendly `WxH` out. Accepts `"16:9"`, `"16x9"`,
 `"16×9"` or a decimal factor (`"1.5"`). Studio spec defaults: sides multiple
-of 32, ~2 MP target, area bounded 512²..1536²; overridable per call
-(`multiple`, `targetMP`, `minSide`, `maxSide`). Answer:
+of 32, ~2 MP target, area floor 512², **no ceiling** (the consumer's canvas is
+what the consumer asked for; a tool's own limits are the tool's business);
+overridable per call (`multiple`, `targetMP`, `minSide`, `maxSide` — the last
+one restores a ceiling when the caller wants it). Answer:
 `{aspect, width, height, pixels, multiple}`. The algorithm
 (`internal/resolution`) lives here and nowhere else.
 
@@ -525,3 +680,9 @@ With `llm_offload=true` the daemon talks to the OpenAI-compatible provider
 Reload is the chat frontend's business, not the scheduler's. The XOR fires
 on the wave itself: an in-chat tool call and the tools it launches share one
 GPU, so offload-then-run is the only legal order (the call-site law).
+After a GPU wave the runner **drains the pool** before releasing it: reaped
+children tear their driver contexts down asynchronously, so a reload fired at
+once can cudaMalloc into still-held VRAM and OOM. The drain floors first,
+polls the load of every queryable slot, and returns when the summed load goes
+quiet or a ceiling passes — best-effort, bounded, invisible to the consumer
+(the wave result is merely honest: the card is handed back truly idle).
