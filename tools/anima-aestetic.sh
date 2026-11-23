@@ -54,6 +54,8 @@ esac
 prompt="${NERV_PROMPT:?missing required param: NERV_PROMPT}"
 negative="${NERV_NEGATIVE_PROMPT:+$NERV_NEGATIVE_PROMPT, }$DEFAULT_NEGATIVE"
 seed="${NERV_SEED:--1}"
+[ "$seed" != "-1" ] || seed=$(od -An -tu4 -N4 /dev/urandom | tr -d " ")
+seed=$(( seed & 0x7FFFFFFFFFFFFFFF ))
 # hidden fields — invisible to the consumer-AI; the script is the authority
 # and applies the same defaults its --tool-info declares.
 cfg_scale="${NERV_CFG_SCALE:-5.0}"

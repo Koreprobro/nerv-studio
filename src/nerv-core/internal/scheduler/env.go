@@ -78,6 +78,10 @@ func (s *Scheduler) buildEnv(e *Admitted) ([]string, error) {
 		}
 		env = append(env, k+"="+v)
 	}
+	// Seed: replace the -1 sentinel with a hardware-random value before
+	// params flow to the script env. The script further masks to its engine's
+	// ceiling (ComfyUI: 53 bits, audio-cpp: 32 bits, sd-cpp: 63 bits).
+	resolveSeed(e.j.Params)
 	keys := make([]string, 0, len(e.j.Params))
 	for k := range e.j.Params {
 		keys = append(keys, k)
